@@ -1745,7 +1745,9 @@
       n.x = origX + dx;
       n.y = origY + dy;
       g.setAttribute("transform", `translate(${n.x} ${n.y})`);
-      if (currentViewGraph) draw(currentViewGraph);
+      // Do NOT call draw() here — it does svg.innerHTML = "" which detaches
+      // this <g> element and breaks pointer capture (esp. in Firefox).
+      // Edges update on pointerup instead.
     });
     g.addEventListener("pointerup", (e) => {
       dragging = false;
@@ -1753,6 +1755,8 @@
         g.releasePointerCapture(e.pointerId);
       } catch {}
       if (moved) e.stopPropagation();
+      // Redraw once at the end so edges follow the new node position.
+      if (moved && currentViewGraph) draw(currentViewGraph);
     });
   }
 
