@@ -145,7 +145,7 @@ function extractImports(src, filePath = "") {
   const ext = path.extname(filePath).toLowerCase();
   if (ext === ".py") return extractPythonImports(src);
   if (ext === ".go") return extractGoImports(src);
-  if (ext === ".rs") return extractRustImports(src);
+  if (ext === ".rs") return require("./rust.js").extractRustImports(src);
   return extractJsImports(src);
 }
 
@@ -774,6 +774,9 @@ async function scanProject(root, opts = {}) {
     }
   } catch { }
 
+  const { discoverCratePackages, resolveRustImport } = require("./rust.js");
+  const { packages: cratePackages, fileToPackage } = discoverCratePackages(root, files);
+
   onProgress({ phase: "parse_imports", files: files.length });
   await Promise.all(files.map(async (f) => {
     const rel = path.relative(root, f).split(path.sep).join("/");
@@ -791,6 +794,36 @@ async function scanProject(root, opts = {}) {
     fileSymbols.set(f, symbols);
 
     const ext = path.extname(f).toLowerCase();
+
+    if (ext === ".rs") {
+      // Rust: use resolveRustImport exclusively — never resolveRel or resolveAlias
+      if (importData.warnings && importData.warnings.length > 0) {
+        for (const w of importData.warnings) {
+          process.stderr.write(`reality-map: ${w}\n`);
+        }
+      }
+
+      const ctx = { cratePackages, fileToPackage, allFiles: fileSet };
+      for (const c of (importData.classified || [])) {
+        const resolved = resolveRustImport(f, c, ctx);
+        if (resolved && resolved !== f) {
+          fileEdges.push([f, resolved]);
+        }
+      }
+
+      // For external crates not in cratePackages, bump externalCounts
+      for (const c of (importData.classified || [])) {
+        if (c.kind === "external") {
+          const crateName = c.segments[0];
+          if (!cratePackages.has(crateName)) {
+            externalCounts.set(crateName, (externalCounts.get(crateName) || 0) + 1);
+          }
+        }
+      }
+
+      return; // Skip the generic resolver flow entirely for .rs files
+    }
+
     for (const s of importData.specs) {
       if (s.startsWith(".") || s.startsWith("/")) {
         const tgt = resolveRel(f, s, fileSet, codeExtSet);

@@ -240,6 +240,39 @@ npx reality-map --deps --fail-on-vuln critical
 | Go         | `.go`                      |
 | Rust       | `.rs`                      |
 
+### Rust
+
+The resolver walks `.rs` files and builds edges from `use` statements and `mod` declarations.
+
+**What resolves:**
+
+- `use crate::path::to::Item` — resolved relative to the crate root (`src/lib.rs`, `src/main.rs`, or the path set in `[lib]`/`[[bin]]`)
+- Group imports — `use a::{b, c::{d, e}}` is expanded before resolution; each leaf becomes an independent edge
+- `mod foo;` declarations — resolved to `foo.rs` or `foo/mod.rs` relative to the declaring file
+- `use super::…` — walks up the module tree; multiple `super::` levels are followed correctly; edges land on `mod.rs` / `lib.rs` / `main.rs` when the item is defined there
+- `use self::…` — resolved relative to the current module file
+- Cross-workspace crate references — `use crate_name::…` is matched against workspace members by package name, then resolved into that crate's root
+
+**Cargo awareness:**
+
+- Workspace manifests — `[workspace] members = [...]` entries are enumerated; glob patterns like `crates/*` are expanded
+- Custom lib roots — `[lib] path = "…"` overrides the default `src/lib.rs`
+- Binary entries — `[[bin]] path = "…"` entries are registered as additional roots
+
+**Resolution bias — under-resolves rather than fabricates:**
+
+- Half-resolved paths (some segments matched, remainder unresolvable) attribute to the last matched file
+- Zero-resolved paths are dropped entirely — no phantom edges
+- `super::Item` / `self::Item` where the item lives in the parent module file correctly lands on `mod.rs` / `lib.rs` / `main.rs`
+
+**Limitations:**
+
+- `macro_rules!`-generated modules — not expanded; the resolver treats them as always-present and will not flag missing targets
+- `#[path = "alt.rs"] mod foo;` — detected and dropped with a stderr warning; the edge is not emitted
+- `extern crate foo;` — detected and dropped with a stderr warning; use `use` statements instead
+- `pub use crate::a::B as C;` — captured as a real edge to `B`'s definition location, but re-export chains are not followed; consumers of `C` will not have their edges retargeted through the alias
+- Inline-table TOML in `Cargo.toml` (e.g. `lib = { path = "src/mylib.rs" }`) — parsed without error but the custom path is not honoured; the resolver falls back to the default `src/lib.rs` layout
+
 ---
 
 ## Ignore files
