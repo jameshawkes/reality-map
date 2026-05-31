@@ -164,6 +164,8 @@
           <button type="button" class="layout-btn" data-layout="server" title="Server-computed layered layout">layered</button>
           <button type="button" class="layout-btn" data-layout="radial" title="Radial / circular layout">radial</button>
           <button type="button" class="layout-btn" data-layout="force" title="Force-directed layout">force</button>
+          <button type="button" class="layout-btn" data-layout="dagre" title="Dagre Sugiyama layered">dagre</button>
+          <button type="button" class="layout-btn" data-layout="elk" title="ELK layered (lazy-loaded, recomputes on click)">elk</button>
         </div>
         <div class="graph-ctrl-group">
           <span class="graph-ctrl-label">edges</span>
@@ -423,6 +425,8 @@
   <!-- Toast -->
   <div id="rm-toast" hidden style="position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 16px;display:flex;align-items:center;gap:12px;z-index:99;box-shadow:0 4px 24px rgba(0,0,0,0.4);font-size:13px"></div>
 
+  <script src="/vendor/dagre.min.js"></script>
+  <script>window.dagre = dagre;</script>
   <script src="/app.js"></script>
 </body>
 </html>

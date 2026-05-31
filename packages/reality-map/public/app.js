@@ -154,8 +154,22 @@
   // ── Phase 3: layout algorithms ────────────────────────────────
   // "server" | "radial" | "force"
   let currentLayout = localStorage.getItem("rm-layout") || "server";
+  // Elk requires a 1.5MB script-inject + async compute; don't auto-fire on tab open.
+  // Downgrade silently to server; the user can re-click elk if they want it.
+  if (currentLayout === "elk") {
+    currentLayout = "server";
+    localStorage.setItem("rm-layout", "server");
+  }
+  // Dagre is synchronous and cheap; the render-path lazy-fill will
+  // compute layoutPositions.dagre on first draw, so no init action needed here.
   // Store computed positions per layout so switching is instant
-  const layoutPositions = { server: null, radial: null, force: null };
+  const layoutPositions = { server: null, radial: null, force: null, dagre: null, elk: null };
+  function invalidateLayoutPositions() {
+    layoutPositions.radial = null;
+    layoutPositions.force = null;
+    layoutPositions.dagre = null;
+    layoutPositions.elk = null;
+  }
 
   function applyLayout(graph) {
     const positions = layoutPositions[currentLayout];
@@ -237,14 +251,101 @@
     return positions;
   }
 
+  function computeDagrePositions(nodes, edges) {
+    if (!nodes.length) return new Map();
+    const NW = 220, NH = 70;
+    const g = new dagre.graphlib.Graph({ multigraph: false, compound: false });
+    g.setGraph({ rankdir: "TB", nodesep: 60, ranksep: 90, marginx: 40, marginy: 40 });
+    g.setDefaultEdgeLabel(() => ({}));
+    nodes.forEach((n) => g.setNode(n.id, { width: NW, height: NH }));
+    edges.forEach((e) => g.setEdge(e.source, e.target));
+    console.time("rm-dagre");
+    dagre.layout(g);
+    console.timeEnd("rm-dagre");
+    const positions = new Map();
+    // dagre returns centre coords; convert to top-left: x - NW/2, y - NH/2
+    g.nodes().forEach((id) => {
+      const { x, y } = g.node(id);
+      positions.set(id, { x: Math.round(x - NW / 2), y: Math.round(y - NH / 2) });
+    });
+    return positions;
+  }
+
+  let _elkLoadPromise = null;
+  let _elkInstance = null;
+  function loadElk() {
+    if (_elkLoadPromise) return _elkLoadPromise;
+    _elkLoadPromise = new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "vendor/elk.bundled.js";
+      s.async = true;
+      s.onload = () => {
+        try { _elkInstance = new ELK(); resolve(_elkInstance); }
+        catch (e) { reject(e); }
+      };
+      s.onerror = () => reject(new Error("failed to load vendor/elk.bundled.js"));
+      document.head.appendChild(s);
+    });
+    return _elkLoadPromise;
+  }
+
+  async function computeElkPositions(nodes, edges) {
+    if (!nodes.length) return new Map();
+    const NW = 220, NH = 70;
+    const elk = await loadElk();
+    const graph = {
+      id: "root",
+      layoutOptions: {
+        "elk.algorithm": "layered",
+        "elk.direction": "DOWN",
+        "elk.layered.spacing.nodeNodeBetweenLayers": "80",
+        "elk.spacing.nodeNode": "40",
+      },
+      children: nodes.map((n) => ({ id: n.id, width: NW, height: NH })),
+      edges: edges.map((e, i) => ({ id: `e${i}`, sources: [e.source], targets: [e.target] })),
+    };
+    console.time("rm-elk");
+    const laid = await elk.layout(graph);
+    console.timeEnd("rm-elk");
+    const positions = new Map();
+    for (const c of laid.children || []) {
+      // ELK returns top-left coords; n.x/n.y are also top-left → no conversion needed
+      positions.set(c.id, { x: Math.round(c.x), y: Math.round(c.y) });
+    }
+    return positions;
+  }
+
   function switchLayout(layout) {
     if (layout === currentLayout) return;
     currentLayout = layout;
     localStorage.setItem("rm-layout", layout);
+    if (layout === "elk" && currentViewGraph) {
+      if (!layoutPositions.elk) {
+        const hud = document.getElementById("hud");
+        const prevHud = hud ? hud.textContent : "";
+        if (hud) hud.textContent = "elk laying out…";
+        const inFlightGraph = currentViewGraph;
+        computeElkPositions(inFlightGraph.nodes, inFlightGraph.edges).then((map) => {
+          layoutPositions.elk = map;
+          if (hud) hud.textContent = prevHud;
+          if (currentLayout !== "elk" || currentViewGraph !== inFlightGraph) return;
+          const laid = applyLayout(currentViewGraph);
+          currentViewGraph = laid;
+          fit(laid);
+          draw(laid);
+        }).catch((e) => {
+          if (hud) hud.textContent = prevHud;
+          console.error("[reality-map] elk layout failed:", e);
+        });
+        return;
+      }
+      // cached — fall through to sync apply/fit/draw below
+    }
     // Compute positions lazily for non-server layouts
     if (layout !== "server" && currentViewGraph) {
       if (layout === "radial") layoutPositions.radial = computeRadialPositions(currentViewGraph.nodes);
       if (layout === "force") layoutPositions.force = computeForcePositions(currentViewGraph.nodes, currentViewGraph.edges);
+      if (layout === "dagre") layoutPositions.dagre = computeDagrePositions(currentViewGraph.nodes, currentViewGraph.edges);
     }
     document.querySelectorAll(".layout-btn").forEach((b) => {
       b.classList.toggle("active", b.dataset.layout === layout);
@@ -311,6 +412,7 @@
     view.prefix = null;
     stack = [];
     selected = null;
+    invalidateLayoutPositions();
     render();
   });
 
@@ -906,6 +1008,7 @@
       // Tint background to drilled-in module color
       const n = currentViewGraph && currentViewGraph.nodes.find(x => x.id === moduleId);
       if (n) updateCanvasTint(n);
+      invalidateLayoutPositions();
       render();
       showModuleDrawer(moduleId, true, clickedDepth);
       return;
@@ -923,84 +1026,6 @@
       if (n) updateCanvasTint(n);
       render();
       showModuleDrawer(moduleId);
-    }
-  }
-
-  function filterModules(nodes) {
-    const q = (moduleFilter.value || "").trim().toLowerCase();
-    if (!q) return nodes;
-    return nodes.filter((n) => n.label.toLowerCase().includes(q));
-  }
-
-  function sortModules(nodes) {
-    const key = moduleSort.value;
-    const copy = [...nodes];
-    if (key === "name") copy.sort((a, b) => a.label.localeCompare(b.label));
-    else if (key === "fanIn") copy.sort((a, b) => (b.fanIn || 0) - (a.fanIn || 0));
-    else if (key === "fanOut") copy.sort((a, b) => (b.fanOut || 0) - (a.fanOut || 0));
-    else copy.sort((a, b) => b.loc - a.loc);
-    return copy;
-  }
-
-  function renderArchHealth(graph) {
-    const el = document.getElementById("arch-health");
-    if (!el) return;
-    const nodes = graph.nodes || [];
-    const cycles = graph.cycles || [];
-
-    const signals = [];
-
-    // Cycles
-    if (cycles.length === 0) {
-      signals.push({ color: TONE.emerald, icon: "✓", label: "No circular deps" });
-    } else {
-      signals.push({ color: TONE.rose, icon: "✗", label: `${cycles.length} circular dep${cycles.length > 1 ? "s" : ""}` });
-    }
-
-    // Size balance — ratio of largest to median module LOC
-    if (nodes.length >= 2) {
-      const locs = nodes.map(n => n.loc || 0).filter(l => l > 0).sort((a, b) => a - b);
-      if (locs.length >= 2) {
-        const median = locs[Math.floor(locs.length / 2)];
-        const max = locs[locs.length - 1];
-        const maxNode = nodes.find(n => (n.loc || 0) === max);
-        const ratio = median > 0 ? max / median : Infinity;
-        if (ratio <= 3) {
-          signals.push({ color: TONE.emerald, icon: "✓", label: "Modules balanced" });
-        } else if (ratio <= 8) {
-          signals.push({ color: TONE.amber, icon: "!", label: `${maxNode?.label || "One"} is ${Math.round(ratio)}× median size` });
-        } else {
-          signals.push({ color: TONE.rose, icon: "✗", label: `${maxNode?.label || "One"} is ${Math.round(ratio)}× median — very unbalanced` });
-        }
-      }
-    }
-
-    // Coupling — highest fan-out module
-    if (nodes.length >= 2) {
-      const mostCoupled = nodes.reduce((a, b) => (b.fanOut || 0) > (a.fanOut || 0) ? b : a, nodes[0]);
-      const fanOut = mostCoupled.fanOut || 0;
-      if (fanOut <= 3) {
-        signals.push({ color: TONE.emerald, icon: "✓", label: "Low coupling" });
-      } else if (fanOut <= 6) {
-        signals.push({ color: TONE.amber, icon: "!", label: `${mostCoupled.label} couples to ${fanOut} modules` });
-      } else {
-        signals.push({ color: TONE.rose, icon: "✗", label: `${mostCoupled.label} couples to ${fanOut} modules` });
-      }
-    }
-
-    el.innerHTML = signals.map(s => `
-      <div class="row" style="padding:5px 8px">
-        <span class="dot" style="background:${s.color}"></span>
-        <span class="name" style="font-size:12px"><span style="color:${s.color};margin-right:4px">${s.icon}</span>${s.label}</span>
-      </div>`).join("");
-  }
-
-  function updateDetailPanel(graph) {
-    if (!detailPanel) return;
-    if (!selected) {
-      detailPanel.textContent = "Click a module for details. Double-click to drill in.";
-      detailPanel.className = "detail mono dim";
-      return;
     }
     const n = graph.nodes.find((x) => x.id === selected);
     if (!n) {
@@ -1109,6 +1134,9 @@
       layoutPositions.radial = computeRadialPositions(graph.nodes);
     if (currentLayout === "force" && !layoutPositions.force)
       layoutPositions.force = computeForcePositions(graph.nodes, graph.edges);
+    if (currentLayout === "dagre" && !layoutPositions.dagre)
+      layoutPositions.dagre = computeDagrePositions(graph.nodes, graph.edges);
+    // Note: elk is NOT auto-triggered here — it's async and heavy; user must click the elk button.
     // Re-apply layout after computing positions
     if (currentLayout !== "server") graph = applyLayout(graph);
 
@@ -1144,8 +1172,7 @@
       btn.title = focused ? "Clear cluster filter" : "Focus: show only this cluster";
       btn.onclick = () => {
         selectedClusterFilter = focused ? null : cid;
-        layoutPositions.radial = null;
-        layoutPositions.force = null;
+        invalidateLayoutPositions();
         lastFitKey = "";
         render();
       };
@@ -1851,6 +1878,7 @@
       depthSelect.value = String(view.depth);
       selected = null;
       closeDrawer();
+      invalidateLayoutPositions();
       render();
     };
   }
@@ -1880,6 +1908,7 @@
     depthSelect.value = String(view.depth);
     closeDrawer();
     lastFitKey = "";
+    invalidateLayoutPositions();
     render();
     if (activeTab === "insights") renderInsights();
     if (activeTab === "files") renderFilesTable();
