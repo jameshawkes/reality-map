@@ -465,6 +465,43 @@ function getGitTimestamps(root) {
   return times;
 }
 
+/**
+ * moduleOf(rel, depth) — path-based module bucketing (language-agnostic).
+ *
+ * Algorithm:
+ *   1. Split rel by path separator, drop the filename → dirs[].
+ *   2. If dirs[0] === "src" → "src" or "src/<dirs[1..d]>" (preserves src/ prefix).
+ *   3. If dirs[0] === "app" → "app" or "app/<dirs[1..d]>" (preserves app/ prefix).
+ *   4. Otherwise → dirs.slice(0, d).join("/"), or "(Project Root)" if dirs is empty.
+ *
+ * Override: for .rs files owned by a Cargo workspace member, buildGraphForDepth()
+ * calls rustModuleOf() instead, which buckets by the member's path relative to the
+ * scan root (e.g. "thirdparty/bevy_polyline/src/foo.rs" → "thirdparty/bevy_polyline"
+ * at depth 1, not "thirdparty"). The override fires only when:
+ *   (a) file extension is ".rs", AND
+ *   (b) fileToPackage identifies the file as owned by a workspace member in packages.
+ * Build artifacts (.cpp, .h, generated .js) inside a member dir keep default
+ * path-based grouping because they fail check (a).
+ */
+/**
+ * moduleOf(rel, depth) — default path-based bucketing for all file types.
+ *
+ * Algorithm:
+ *   1. Split the relative path into directory segments (drop the filename).
+ *   2. If the first segment is "src" or "app", strip that prefix and take the
+ *      next `depth-1` segments as the bucket name (falling back to "src"/"app").
+ *   3. Otherwise take the first `depth` directory segments as the bucket name,
+ *      falling back to "(Project Root)" when there are none.
+ *
+ * Override for Rust workspace members:
+ *   Inside `buildGraphForDepth`, when (a) the file extension is `.rs` AND
+ *   (b) `fileToPackage` maps the file to a workspace member present in the
+ *   active `packages` set, this function is NOT used.  Instead the file is
+ *   bucketed by the `rustModuleOf` helper (added in step 5), which computes
+ *   the bucket relative to the Cargo member root rather than the repo root.
+ *   Build artefacts (`.cpp`, `.h`, etc.) that happen to live inside a member
+ *   directory keep this default grouping because they fail check (a).
+ */
 function moduleOf(rel, depth) {
   const parts = rel.split(path.sep).filter(Boolean);
   const dirs = parts.slice(0, -1);
@@ -860,11 +897,55 @@ async function scanProject(root, opts = {}) {
     .sort((a, b) => b[1] - a[1]).slice(0, 20)
     .map(([name, count]) => ({ name, count }));
 
+  /**
+   * rustModuleOf — workspace-aware module bucketing for .rs files.
+   * v3 rule: src/ inside a workspace member is always elided from the module path.
+   * Depth controls only how many intermediate-dir segments inside the member
+   * (after src/) we keep — never how we slice the member path itself.
+   *
+   * Returns null to signal fallback to default moduleOf() for:
+   *   - file not in fileToPackage
+   *   - package not in packages map
+   *   - member-relative path is empty (single-crate-at-root)
+   */
+  function rustModuleOf(absFile, depth, rustCtx) {
+    const { root, fileToPackage, packages } = rustCtx;
+    const pkgName = fileToPackage.get(absFile);
+    if (!pkgName) return null;
+    const pkg = packages.get(pkgName);
+    if (!pkg) return null;
+
+    // Member directory is the directory containing the member's Cargo.toml
+    const memberDir = path.dirname(pkg.manifest);
+    // Member path relative to scan root, POSIX-separated
+    const memberRel = path.relative(root, memberDir).split(path.sep).join("/");
+    if (!memberRel) return null; // single-crate-at-root: member IS the scan root
+
+    // File path relative to scan root, POSIX-separated
+    const fileRel = path.relative(root, absFile).split(path.sep).join("/");
+
+    // Strip member prefix + leading slash
+    let remainder = fileRel.slice(memberRel.length).replace(/^\//, "");
+
+    // Elide leading "src/" inside the member, always
+    if (remainder.startsWith("src/")) remainder = remainder.slice(4);
+
+    // Drop the filename, leaving only intermediate-dir segments
+    const dirParts = remainder.split("/").slice(0, -1);
+
+    // Take up to (depth - 1) intermediate dirs
+    const takeN = Math.max(0, depth - 1);
+    const extra = dirParts.slice(0, takeN);
+
+    return extra.length ? `${memberRel}/${extra.join("/")}` : memberRel;
+  }
+
   function buildGraphForDepth(depth) {
     const modFiles = new Map();
     for (const f of files) {
       const rel = path.relative(root, f).split(path.sep).join("/");
-      const mod = moduleOf(rel, depth);
+      const ext = path.extname(f).toLowerCase();
+      const mod = (ext === ".rs" ? rustModuleOf(f, depth, rustCtx) : null) ?? moduleOf(rel, depth);
       if (!modFiles.has(mod)) modFiles.set(mod, new Set());
       modFiles.get(mod).add(f);
     }
@@ -1081,6 +1162,7 @@ async function scanProject(root, opts = {}) {
   }
 
   onProgress({ phase: "building_graphs", maxDepth });
+  const rustCtx = { root, fileToPackage, packages: cratePackages };
   const graphsByDepth = {};
   for (let depth = 1; depth <= maxDepth; depth++) {
     graphsByDepth[depth] = buildGraphForDepth(depth);

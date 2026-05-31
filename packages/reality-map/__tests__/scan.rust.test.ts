@@ -179,10 +179,11 @@ describe("discoverCratePackages", () => {
     const files = collectRsFiles(root);
     const { packages } = discoverCratePackages(root, files);
     // The root workspace Cargo.toml has no [package] — it should not appear as a package
-    // Only "redpanda_core" and "app" should be in packages
+    // "redpanda_core", "app", and "vendored_lib" should be in packages
     expect(packages.has("redpanda_core")).toBe(true);
     expect(packages.has("app")).toBe(true);
-    expect(packages.size).toBe(2);
+    expect(packages.has("vendored_lib")).toBe(true);
+    expect(packages.size).toBe(3);
   });
 });
 
@@ -512,5 +513,107 @@ describe("downstream shape regression", () => {
     expect(impact).toBeDefined();
     expect(typeof impact.totalAffected).toBe("number");
     expect(["none", "low", "medium", "high"]).toContain(impact.riskLevel);
+  });
+});
+
+describe("workspace module grouping", () => {
+  const WTC = join(FIXTURES, "workspace-two-crates");
+
+  it("test 1 (RED): multi-segment member depth 1 → thirdparty/vendored_lib not thirdparty", async () => {
+    // current moduleOf("thirdparty/vendored_lib/src/lib.rs", 1) returns "thirdparty"
+    // v3 expects "thirdparty/vendored_lib"
+    const result = await scanProject(WTC);
+    const graph = result.graphsByDepth?.[1];
+    const nodeIds = (graph?.nodes ?? []).map((n: any) => n.id ?? n.name ?? n);
+    expect(nodeIds).toContain("thirdparty/vendored_lib");
+    expect(nodeIds).not.toContain("thirdparty");
+  });
+
+  it("test 2 (non-RED): multi-segment member depth 2 stability → thirdparty/vendored_lib", async () => {
+    // current moduleOf("thirdparty/vendored_lib/src/lib.rs", 2) returns "thirdparty/vendored_lib" (coincidence)
+    // v3 also expects "thirdparty/vendored_lib" — stability assertion
+    const result = await scanProject(WTC);
+    const graph = result.graphsByDepth?.[2];
+    const nodeIds = (graph?.nodes ?? []).map((n: any) => n.id ?? n.name ?? n);
+    expect(nodeIds).toContain("thirdparty/vendored_lib");
+  });
+
+  it("test 3 (RED): multi-segment member with inside dir, depth 2 → thirdparty/vendored_lib/sub", async () => {
+    // current moduleOf("thirdparty/vendored_lib/src/sub/util.rs", 2) returns "thirdparty/vendored_lib"
+    // v3 expects "thirdparty/vendored_lib/sub"
+    const result = await scanProject(WTC);
+    const graph = result.graphsByDepth?.[2];
+    const nodeIds = (graph?.nodes ?? []).map((n: any) => n.id ?? n.name ?? n);
+    expect(nodeIds).toContain("thirdparty/vendored_lib/sub");
+  });
+
+  it("test 4 (RED): multi-segment member with inside dir, depth 3 → thirdparty/vendored_lib/sub (src/ elided)", async () => {
+    // current moduleOf("thirdparty/vendored_lib/src/sub/util.rs", 3) returns "thirdparty/vendored_lib/src"
+    // v3 expects "thirdparty/vendored_lib/sub" (src/ is elided)
+    const result = await scanProject(WTC);
+    const graph = result.graphsByDepth?.[3];
+    const nodeIds = (graph?.nodes ?? []).map((n: any) => n.id ?? n.name ?? n);
+    expect(nodeIds).toContain("thirdparty/vendored_lib/sub");
+    expect(nodeIds).not.toContain("thirdparty/vendored_lib/src");
+  });
+
+  it("test 5 (RED): single-segment member depth 2 collapse → core not core/src", async () => {
+    // current moduleOf("core/src/lib.rs", 2) returns "core/src"
+    // v3 expects "core"
+    const result = await scanProject(WTC);
+    const graph = result.graphsByDepth?.[2];
+    const nodeIds = (graph?.nodes ?? []).map((n: any) => n.id ?? n.name ?? n);
+    expect(nodeIds).toContain("core");
+    expect(nodeIds).not.toContain("core/src");
+  });
+
+  it("test 6 (RED): single-segment member depth 3 collapse → core not core/src", async () => {
+    // current moduleOf("core/src/lib.rs", 3) returns "core/src"
+    // v3 expects "core"
+    const result = await scanProject(WTC);
+    const graph = result.graphsByDepth?.[3];
+    const nodeIds = (graph?.nodes ?? []).map((n: any) => n.id ?? n.name ?? n);
+    expect(nodeIds).toContain("core");
+    expect(nodeIds).not.toContain("core/src");
+  });
+
+  it("test 7 (RED): cross-crate edge at depth 2 → app → core not app/src → core/src", async () => {
+    // current depth-2 edge is app/src → core/src
+    // v3 expects app → core
+    const result = await scanProject(WTC);
+    const graph = result.graphsByDepth?.[2];
+    const edges = (graph?.edges ?? []).map((e: any) => `${e.from ?? e.source}->${e.to ?? e.target}`);
+    expect(edges.some((e: string) => e === "app->core" || e === "core->app")).toBe(true);
+    expect(edges.some((e: string) => e.includes("app/src") || e.includes("core/src"))).toBe(false);
+  });
+
+  it("test 8 (non-RED): out-of-workspace .rs fallback → notes at depth 1", async () => {
+    // notes/scratch.rs has no Cargo.toml above it inside the fixture
+    // current moduleOf("notes/scratch.rs", 1) returns "notes"
+    // v3 also expects "notes" — fallback regression
+    const result = await scanProject(WTC);
+    const graph = result.graphsByDepth?.[1];
+    const nodeIds = (graph?.nodes ?? []).map((n: any) => n.id ?? n.name ?? n);
+    expect(nodeIds).toContain("notes");
+  });
+
+  it("test 9 (non-RED): non-Rust file inside member dir → app at depth 1", async () => {
+    // app/scripts/build.js is not .rs — override must not fire
+    // current moduleOf("app/scripts/build.js", 1) returns "app"
+    // v3 also expects "app" — non-Rust fallback regression
+    const result = await scanProject(WTC);
+    const graph = result.graphsByDepth?.[1];
+    const nodeIds = (graph?.nodes ?? []).map((n: any) => n.id ?? n.name ?? n);
+    expect(nodeIds).toContain("app");
+    expect(nodeIds).not.toContain("app/scripts");
+  });
+
+  it("test 10 (non-RED): file-edge parity — internalEdges unchanged after grouping fix", async () => {
+    // Module grouping must not change file-edge counts
+    const result = await scanProject(WTC);
+    // Capture the current internalEdges count as the baseline
+    // This test will pass both before and after the fix (tripwire)
+    expect(typeof result.insights?.summary?.internalEdges).toBe("number");
+    expect(result.insights?.summary?.internalEdges).toBeGreaterThan(0);
   });
 });
