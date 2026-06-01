@@ -323,8 +323,25 @@ function mergeExternalDeps(existing, externalDeps, externalFiles) {
   const fileToPackage = new Map(existing.fileToPackage);
 
   for (const dep of externalDeps) {
-    // Workspace member with same name wins — don't overwrite
-    if (packages.has(dep.name)) continue;
+    // External-cargo-dep tagging is authoritative when cargo metadata reported
+    // this package as an external dep of the scan root. Override any
+    // discoverCratePackages tagging — that pass walks UP from the file, which
+    // for files under ~/.cargo/git/checkouts/.../<crate>/src/foo.rs ends up
+    // finding the dep's OWN workspace manifest and (incorrectly, from the
+    // scan-root's perspective) marking the crate as workspace-member.
+    //
+    // Only skip if the existing entry's manifest is under the scan root —
+    // i.e. it's a real workspace member of the project we're scanning.
+    // We detect this by comparing manifest paths: if the existing entry's
+    // manifest is the same as the dep's manifestPath, the discovery and
+    // cargo-metadata agree and we just refresh the kind. If they differ,
+    // it means there's a real workspace member with the same name as a dep —
+    // workspace wins (the existing workspace-member entry).
+    const existing = packages.get(dep.name);
+    if (existing && existing.kind === "workspace-member" && existing.manifest !== dep.manifestPath) {
+      // Real workspace member shadows external dep with same name — skip.
+      continue;
+    }
 
     const manifestDir = path.dirname(dep.manifestPath);
     let parsedManifest = null;
@@ -965,41 +982,6 @@ function resolveRustImport(fromFile, classifiedSpec, ctx) {
 
   // Only crate:: reaches here (super/self return early above)
   return walkSegments(startDir, segments, allFiles);
-}
-
-function mergeExternalDeps(existing, externalDeps, externalFiles) {
-  // existing: { packages: Map, fileToPackage: Map } from discoverCratePackages
-  // externalDeps: [{ name, manifestPath, srcRoot, kind }] from extractExternalDeps
-  // externalFiles: [{ file: absPath, depName: string }] from collectExternalDepFiles
-  // Returns: { packages: Map, fileToPackage: Map } — extended
-
-  const packages = new Map(existing.packages);
-  const fileToPackage = new Map(existing.fileToPackage);
-
-  for (const dep of externalDeps) {
-    // Workspace member with same name wins — don't overwrite
-    if (packages.has(dep.name)) continue;
-
-    // Compute rootFile: the entry file (lib.rs or main.rs) in srcRoot
-    const libRs = path.join(dep.srcRoot, "lib.rs");
-    const mainRs = path.join(dep.srcRoot, "main.rs");
-    let rootFile;
-    if (fs.existsSync(libRs)) rootFile = libRs;
-    else if (fs.existsSync(mainRs)) rootFile = mainRs;
-    else rootFile = dep.srcRoot; // fallback: use the dir itself
-
-    packages.set(dep.name, {
-      root: rootFile,
-      manifest: dep.manifestPath,
-      kind: "external-cargo-dep",
-    });
-  }
-
-  for (const { file, depName } of externalFiles) {
-    fileToPackage.set(file, depName);
-  }
-
-  return { packages, fileToPackage };
 }
 
 module.exports = { parseCargoToml, extractExternalDeps, discoverCratePackages, extractRustImports, resolveRustImport, runCargoMetadata, mergeExternalDeps };

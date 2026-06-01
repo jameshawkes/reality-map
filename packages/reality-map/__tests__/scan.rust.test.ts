@@ -527,7 +527,15 @@ describe("downstream shape regression", () => {
 function normalizeForDiff(scan: any): any {
   const clone = JSON.parse(JSON.stringify(scan));
   function strip(obj: any): any {
-    if (Array.isArray(obj)) return obj.map(strip);
+    if (Array.isArray(obj)) {
+      const stripped = obj.map(strip);
+      // Stable sort arrays of objects to defeat tied-count iteration-order
+      // non-determinism in fields like topImported / topImporters.
+      if (stripped.length > 1 && stripped.every((x) => x && typeof x === "object" && !Array.isArray(x))) {
+        return stripped.slice().sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+      }
+      return stripped;
+    }
     if (obj && typeof obj === "object") {
       const out: any = {};
       for (const key of Object.keys(obj).sort()) {
