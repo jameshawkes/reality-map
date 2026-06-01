@@ -2,6 +2,14 @@ import { describe, it, expect } from "vitest";
 import { createRequire } from "module";
 import { readdirSync, statSync } from "fs";
 import { join, resolve } from "path";
+import { spawnSync } from "child_process";
+
+const hasCargo = (() => {
+  try {
+    const r = spawnSync("cargo", ["--version"], { stdio: "ignore" });
+    return r.status === 0;
+  } catch { return false; }
+})();
 
 const require = createRequire(import.meta.url);
 const { parseCargoToml, discoverCratePackages, extractRustImports, resolveRustImport } = require("../lib/rust.js");
@@ -516,6 +524,23 @@ describe("downstream shape regression", () => {
   });
 });
 
+function normalizeForDiff(scan: any): any {
+  const clone = JSON.parse(JSON.stringify(scan));
+  function strip(obj: any): any {
+    if (Array.isArray(obj)) return obj.map(strip);
+    if (obj && typeof obj === "object") {
+      const out: any = {};
+      for (const key of Object.keys(obj).sort()) {
+        if (key === "generatedAt" || key === "scanMs" || key === "followDeps") continue;
+        out[key] = strip(obj[key]);
+      }
+      return out;
+    }
+    return obj;
+  }
+  return strip(clone);
+}
+
 describe("workspace module grouping", () => {
   const WTC = join(FIXTURES, "workspace-two-crates");
 
@@ -615,5 +640,161 @@ describe("workspace module grouping", () => {
     // This test will pass both before and after the fix (tripwire)
     expect(typeof result.insights?.summary?.internalEdges).toBe("number");
     expect(result.insights?.summary?.internalEdges).toBeGreaterThan(0);
+  });
+});
+
+describe("follow external cargo deps", () => {
+  const WSDEP = join(FIXTURES, "workspace-with-external-dep");
+
+  const { runCargoMetadata, extractExternalDeps, mergeExternalDeps } = require("../lib/rust.js");
+
+  // Hand-crafted cargo-metadata-shaped object for unit tests
+  function makeMetadata(packages: any[], workspaceMembers: string[]) {
+    return { packages, workspace_members: workspaceMembers };
+  }
+
+  it("extractExternalDeps: workspace members are filtered via workspace_members[]", () => {
+    const meta = makeMetadata(
+      [
+        { id: "wm1", name: "app", manifest_path: "/ws/app/Cargo.toml", targets: [{ kind: ["lib"], src_path: "/ws/app/src/lib.rs" }] },
+        { id: "ext1", name: "bits", manifest_path: "/cache/bits/Cargo.toml", targets: [{ kind: ["lib"], src_path: "/cache/bits/src/lib.rs" }] },
+      ],
+      ["wm1"]
+    );
+    const deps = extractExternalDeps(meta);
+    expect(deps).toHaveLength(1);
+    expect(deps[0].name).toBe("bits");
+  });
+
+  it("extractExternalDeps: git/path/registry deps all included", () => {
+    const meta = makeMetadata(
+      [
+        { id: "ext1", name: "serde", source: "registry+https://...", manifest_path: "/r/serde/Cargo.toml", targets: [{ kind: ["lib"], src_path: "/r/serde/src/lib.rs" }] },
+        { id: "ext2", name: "bits", source: "git+https://...", manifest_path: "/g/bits/Cargo.toml", targets: [{ kind: ["lib"], src_path: "/g/bits/src/lib.rs" }] },
+        { id: "ext3", name: "local-dep", source: null, manifest_path: "/p/local-dep/Cargo.toml", targets: [{ kind: ["lib"], src_path: "/p/local-dep/src/lib.rs" }] },
+      ],
+      []
+    );
+    const deps = extractExternalDeps(meta);
+    expect(deps).toHaveLength(3);
+    expect(deps.map((d: any) => d.name).sort()).toEqual(["bits", "local-dep", "serde"]);
+  });
+
+  it("extractExternalDeps: proc-macro-only packages are skipped", () => {
+    const meta = makeMetadata(
+      [
+        { id: "ext1", name: "proc-mac", manifest_path: "/p/Cargo.toml", targets: [{ kind: ["proc-macro"], src_path: "/p/src/lib.rs" }] },
+        { id: "ext2", name: "normal", manifest_path: "/n/Cargo.toml", targets: [{ kind: ["lib"], src_path: "/n/src/lib.rs" }] },
+      ],
+      []
+    );
+    const deps = extractExternalDeps(meta);
+    expect(deps.map((d: any) => d.name)).toEqual(["normal"]);
+  });
+
+  it("extractExternalDeps: source=null path dep is still included if not in workspace_members", () => {
+    const meta = makeMetadata(
+      [
+        { id: "ext1", name: "path-dep", source: null, manifest_path: "/p/path-dep/Cargo.toml", targets: [{ kind: ["lib"], src_path: "/p/path-dep/src/lib.rs" }] },
+      ],
+      []
+    );
+    const deps = extractExternalDeps(meta);
+    expect(deps).toHaveLength(1);
+    expect(deps[0].name).toBe("path-dep");
+  });
+
+  it("extractExternalDeps: empty packages returns []", () => {
+    expect(extractExternalDeps(makeMetadata([], []))).toEqual([]);
+  });
+
+  it("mergeExternalDeps adds external-cargo-dep entries to packages map", () => {
+    const existing = {
+      packages: new Map([["app", { root: "/ws/app/src/lib.rs", manifest: "/ws/app/Cargo.toml", kind: "workspace-member" }]]),
+      fileToPackage: new Map(),
+    };
+    // srcRoot must point to a real directory for fs.existsSync — use the fixture's bits src
+    const bitsSrcRoot = join(WSDEP, "fake-cargo-cache/bits/src");
+    const externalDeps = [
+      { name: "bits", manifestPath: join(WSDEP, "fake-cargo-cache/bits/Cargo.toml"), srcRoot: bitsSrcRoot },
+    ];
+    const externalFiles = [
+      { file: join(bitsSrcRoot, "lib.rs"), depName: "bits" },
+      { file: join(bitsSrcRoot, "types.rs"), depName: "bits" },
+    ];
+    const result = mergeExternalDeps(existing, externalDeps, externalFiles);
+    expect(result.packages.has("app")).toBe(true);
+    expect(result.packages.has("bits")).toBe(true);
+    expect(result.packages.get("bits").kind).toBe("external-cargo-dep");
+    expect(result.fileToPackage.get(join(bitsSrcRoot, "lib.rs"))).toBe("bits");
+    expect(result.fileToPackage.get(join(bitsSrcRoot, "types.rs"))).toBe("bits");
+  });
+
+  it("mergeExternalDeps: workspace member shadows dep with same name (workspace wins)", () => {
+    const existing = {
+      packages: new Map([["bits", { root: "/ws/bits/src/lib.rs", manifest: "/ws/bits/Cargo.toml", kind: "workspace-member" }]]),
+      fileToPackage: new Map(),
+    };
+    const externalDeps = [
+      { name: "bits", manifestPath: "/cache/bits/Cargo.toml", srcRoot: "/cache/bits/src" },
+    ];
+    const result = mergeExternalDeps(existing, externalDeps, []);
+    // Workspace member must not be overwritten in packages
+    expect(result.packages.get("bits").kind).toBe("workspace-member");
+    expect(result.packages.get("bits").manifest).toBe("/ws/bits/Cargo.toml");
+  });
+
+  it("scanProject without followDeps: completes and returns fileDetails", async () => {
+    const result = await scanProject(WSDEP, { followDeps: false });
+    expect(result).toBeDefined();
+    expect(result.fileDetails).toBeDefined();
+    // app/src/main.rs must be in the scan
+    expect(result.scannedFilePaths).toContain("app/src/main.rs");
+    // Without followDeps, no followDeps key on result
+    expect(result.followDeps).toBeUndefined();
+  });
+
+  it("scanProject with followDeps=true: completes without throwing", async () => {
+    // If cargo is absent, runCargoMetadata returns { ok: false } and scan proceeds normally.
+    // If cargo is present, it will attempt to resolve deps (may or may not find them without Cargo.lock).
+    // Either way, scan must complete and return a valid result.
+    const result = await scanProject(WSDEP, { followDeps: true });
+    expect(result).toBeDefined();
+    expect(result.fileDetails).toBeDefined();
+    expect(result.scannedFilePaths).toContain("app/src/main.rs");
+  });
+
+  it.skipIf(!hasCargo)("real cargo metadata: workspace-two-crates returns valid metadata", () => {
+    const manifestPath = join(FIXTURES, "workspace-two-crates", "Cargo.toml");
+    const result = runCargoMetadata(manifestPath);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.metadata.packages.length).toBeGreaterThanOrEqual(1);
+      expect(extractExternalDeps(result.metadata)).toEqual([]);
+    }
+  });
+
+  it("normalized scan output: normalizeForDiff strips non-deterministic fields", async () => {
+    // Without flag
+    const without = await scanProject(WSDEP, { followDeps: false });
+    // With flag
+    const withFlag = await scanProject(WSDEP, { followDeps: true });
+
+    // Strip non-deterministic + followDeps field
+    const normA = normalizeForDiff(without);
+    const normB = normalizeForDiff(withFlag);
+
+    // Verify normalize works and produces deterministic output
+    expect(normA).toBeDefined();
+    expect(normB).toBeDefined();
+    // The followDeps key should be stripped from both
+    expect(normA.followDeps).toBeUndefined();
+    expect(normB.followDeps).toBeUndefined();
+    // generatedAt should be stripped
+    expect(normA.generatedAt).toBeUndefined();
+    expect(normB.generatedAt).toBeUndefined();
+    // root should still be present (not stripped)
+    expect(normA.root).toBe(WSDEP);
+    expect(normB.root).toBe(WSDEP);
   });
 });

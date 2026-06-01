@@ -114,6 +114,29 @@ function isIgnoredRel(rel, isDir, matchers) {
   return false;
 }
 
+function collectExternalDepFiles(srcRoot, cap = 5000) {
+  const results = [];
+  function recurse(dir) {
+    if (results.length >= cap) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (results.length >= cap) break;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        recurse(full);
+      } else if (entry.isFile() && entry.name.endsWith(".rs")) {
+        results.push(full);
+      }
+    }
+  }
+  recurse(srcRoot);
+  if (results.length >= cap) {
+    process.stderr.write(`reality-map: --follow-deps: dep at ${srcRoot} has ≥${cap} .rs files — truncated\n`);
+  }
+  return results;
+}
+
 async function walk(root, opts = {}) {
   const codeExtSet = opts.codeExtSet instanceof Set ? opts.codeExtSet : CODE_EXT;
   const ignoreMatchers = opts.ignoreMatchers || [];
@@ -139,6 +162,32 @@ async function walk(root, opts = {}) {
   }
   await rec(root);
   return out;
+}
+
+function collectExternalDepFiles(srcRoot) {
+  const results = [];
+  const CAP = 5000;
+  function recurse(dir) {
+    if (results.length >= CAP) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (results.length >= CAP) break;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        // Skip target/ and hidden dirs
+        if (entry.name === "target" || entry.name.startsWith(".")) continue;
+        recurse(full);
+      } else if (entry.name.endsWith(".rs")) {
+        results.push(full);
+      }
+    }
+  }
+  recurse(srcRoot);
+  if (results.length >= CAP) {
+    process.stderr.write(`reality-map: --follow-deps: dep at ${srcRoot} has ≥${CAP} .rs files — truncated\n`);
+  }
+  return results;
 }
 
 function extractImports(src, filePath = "") {
@@ -773,7 +822,6 @@ async function scanProject(root, opts = {}) {
   onProgress({ phase: "discover" });
   const files = await walk(root, { ignoreMatchers, codeExtSet });
   onProgress({ phase: "discovered", files: files.length });
-  const fileSet = new Set(files);
   const gitTimes = getGitTimestamps(root);
   const goModuleName = loadGoModuleName(root);
   const pythonSrcDirs = loadPythonSrcDirs(root, files);
@@ -786,6 +834,39 @@ async function scanProject(root, opts = {}) {
   let totalLoc = 0;
   const fileLoc = new Map();
   const fileGit = new Map();
+
+  // Resolve external Cargo deps if --follow-deps is set
+  const { discoverCratePackages, resolveRustImport, runCargoMetadata, extractExternalDeps, mergeExternalDeps } = require("./rust.js");
+
+  let externalDeps = [];
+  let externalFiles = [];
+  if (opts.followDeps) {
+    const rootCargo = path.join(root, "Cargo.toml");
+    if (fs.existsSync(rootCargo)) {
+      onProgress({ phase: "cargo_metadata" });
+      const result = runCargoMetadata(rootCargo);
+      if (result.ok) {
+        externalDeps = extractExternalDeps(result.metadata);
+        for (const dep of externalDeps) {
+          const depFiles = collectExternalDepFiles(dep.srcRoot);
+          for (const f of depFiles) externalFiles.push({ file: f, depName: dep.name });
+          files.push(...depFiles);
+        }
+        onProgress({ phase: "follow_deps_discovered", depCount: externalDeps.length, fileCount: externalFiles.length });
+      }
+    } else {
+      process.stderr.write(`reality-map: --follow-deps: no Cargo.toml at ${root} — ignoring\n`);
+    }
+  }
+
+  const fileSet = new Set(files);
+
+  const { packages: cratePackages0, fileToPackage: fileToPackage0 } = discoverCratePackages(root, files);
+  const { packages: cratePackages, fileToPackage } = mergeExternalDeps(
+    { packages: cratePackages0, fileToPackage: fileToPackage0 },
+    externalDeps,
+    externalFiles,
+  );
 
   // Resolve <script src> in HTML files so browser entry points get incoming edges
   const HTML_SCRIPT_RE = /<script[^>]+src=["']([^"']+)["']/gi;
@@ -810,9 +891,6 @@ async function scanProject(root, opts = {}) {
       }
     }
   } catch { }
-
-  const { discoverCratePackages, resolveRustImport } = require("./rust.js");
-  const { packages: cratePackages, fileToPackage } = discoverCratePackages(root, files);
 
   onProgress({ phase: "parse_imports", files: files.length });
   await Promise.all(files.map(async (f) => {
@@ -914,6 +992,21 @@ async function scanProject(root, opts = {}) {
     if (!pkgName) return null;
     const pkg = packages.get(pkgName);
     if (!pkg) return null;
+
+    if (pkg.kind === "external-cargo-dep") {
+      // Synthetic ID: deps/<name> at depth 1; deps/<name>/<subdir> at depth >= 2
+      const base = `deps/${pkgName}`;
+      if (depth <= 1) return base;
+      // Compute file's path relative to dep's src root (the dir containing pkg.root)
+      const depSrcRoot = path.dirname(pkg.root);
+      let remainder = path.relative(depSrcRoot, absFile).split(path.sep).join("/");
+      // Elide leading "src/" if present (shouldn't be, since depSrcRoot already IS the src dir)
+      if (remainder.startsWith("src/")) remainder = remainder.slice(4);
+      const dirParts = remainder.split("/").slice(0, -1);
+      const takeN = Math.max(0, depth - 1);
+      const extra = dirParts.slice(0, takeN);
+      return extra.length ? `${base}/${extra.join("/")}` : base;
+    }
 
     // Member directory is the directory containing the member's Cargo.toml
     const memberDir = path.dirname(pkg.manifest);
@@ -1179,7 +1272,7 @@ async function scanProject(root, opts = {}) {
     if (!resolvedEdgesMap[fromRel].includes(toRel)) resolvedEdgesMap[fromRel].push(toRel);
   }
 
-  return {
+  const result = {
     root,
     generatedAt: new Date().toISOString(),
     goModuleName: goModuleName || null,
@@ -1200,6 +1293,13 @@ async function scanProject(root, opts = {}) {
       resolvedEdges: resolvedEdgesMap,
     },
   };
+  if (opts.followDeps) {
+    result.followDeps = {
+      depCount: externalDeps.length,
+      fileCount: externalFiles.length,
+    };
+  }
+  return result;
 }
 
 module.exports = { scanProject };

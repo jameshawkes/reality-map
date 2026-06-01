@@ -273,6 +273,45 @@ The resolver walks `.rs` files and builds edges from `use` statements and `mod` 
 - `pub use crate::a::B as C;` — captured as a real edge to `B`'s definition location, but re-export chains are not followed; consumers of `C` will not have their edges retargeted through the alias
 - Inline-table TOML in `Cargo.toml` (e.g. `lib = { path = "src/mylib.rs" }`) — parsed without error but the custom path is not honoured; the resolver falls back to the default `src/lib.rs` layout
 
+### Following Cargo dependencies — `--follow-deps`
+
+By default, reality-map only scans files inside the directory you point it at. For
+Rust projects, that means `use external_crate::Foo` resolves to a dead end — the
+external crate's source isn't part of the scan.
+
+Pass `--follow-deps` to make reality-map shell out to `cargo metadata` and pull in
+every dependency (path, git, registry) reported by Cargo. External deps appear as
+module nodes named `deps/<crate-name>` and their files are scanned alongside your
+own.
+
+```sh
+node bin/cli.js --follow-deps /path/to/your/cargo/project
+```
+
+**Requirements:**
+- `cargo` must be on `PATH`. If absent, reality-map emits one stderr line and falls
+  back to scanning only the local files.
+- The scan root must contain a `Cargo.toml`. If absent, the flag is a no-op.
+
+**Cost:**
+- `cargo metadata` typically completes in 1–5 seconds on cached workspaces, up to
+  30 seconds if Cargo decides to refresh registry metadata.
+- File count balloons. On `polytope-server` (8 workspace members + 538 transitive
+  deps), `--follow-deps` adds ~14,000 `.rs` files to the scan and takes ~30 seconds.
+- Per-dep cap: each external dep can contribute at most 5000 `.rs` files. Beyond
+  that, the remainder is truncated with a stderr warning.
+
+**Limitations:**
+- No `--deps-mode={path,git,registry,all}` filtering yet (v2 follow-up). It's
+  all-or-nothing for now.
+- No `--deps-filter=PATTERN` regex (v2 follow-up).
+- No `--deps-offline` flag. If `Cargo.lock` is stale, cargo may fetch from the
+  network (we do not pass `--offline`).
+- External dep file paths are absolute and machine-specific (under
+  `~/.cargo/git/checkouts/...` or `~/.cargo/registry/src/...`). Module-graph IDs
+  use a synthetic `deps/<crate-name>` prefix so the graph is portable.
+- Workspace member `foo` shadows external dep `foo` — workspace wins.
+
 ---
 
 ## Ignore files

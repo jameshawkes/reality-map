@@ -68,6 +68,7 @@ function parseArgs(argv) {
     failOnVuln: null,
     unreachableFiles: null, // {entry, srcDir}
     unreachableFilesJson: false,
+    followDeps: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -214,6 +215,8 @@ function parseArgs(argv) {
       args.noColor = true;
     } else if (a === "--deps") {
       args.deps = true;
+    } else if (a === "--follow-deps") {
+      args.followDeps = true;
     } else if (a === "--deps-json") {
       args.depsJson = true;
       args.deps = true;
@@ -315,6 +318,7 @@ Options:
       --fail-on-vuln [severity]
                      Exit 1 if vulnerabilities at or above severity are found (default: critical)
                      Severity levels: low, moderate, high, critical
+      --follow-deps          Follow Cargo dependencies (git, path, registry) into the scan
   -h, --help         Show help
   -V, --version      Print version
 
@@ -569,6 +573,7 @@ function buildDependencyTree(scan, modId, maxDepth) {
   const scanOpts = {
     maxDepth: args.depth,
     includeExt: args.includeExt.length ? args.includeExt : undefined,
+    followDeps: args.followDeps,
     onProgress:
       args.quiet || args.jsonOut || args.summaryJson || args.listFiles
         ? undefined
@@ -725,6 +730,9 @@ function buildDependencyTree(scan, modId, maxDepth) {
     log(
       `  ${dim("summary")}  ${bold(scan.stats.files)} files · ${bold(depth1.stats.modules)} modules · ${bold(depth1.stats.edges)} edges · ${depth1.stats.cycles} cycle(s) · ${extRefs} ext. refs · depth ${args.depth} ${dim(`(${scanMs}ms)`)}`
     );
+    if (scan.followDeps) {
+      log(`  ${dim("follow-deps")}  ${scan.followDeps.depCount} external crates, ${scan.followDeps.fileCount} .rs files added`);
+    }
   }
 
   if (args.exportDot && graphForExport) {

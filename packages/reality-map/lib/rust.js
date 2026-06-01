@@ -2,6 +2,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { spawnSync } = require("child_process");
 
 function parseCargoToml(text) {
   // 1. Normalise CRLF → LF
@@ -230,6 +231,121 @@ function parseCargoToml(text) {
   flushArray();
 
   return result;
+}
+
+function runCargoMetadata(manifestPath) {
+  const spawnResult = spawnSync(
+    "cargo",
+    ["metadata", "--format-version=1", `--manifest-path=${manifestPath}`],
+    { timeout: 60_000, maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] }
+  );
+
+  if (spawnResult.error && spawnResult.error.code === "ENOENT") {
+    process.stderr.write(
+      "reality-map: --follow-deps: cargo not found on PATH — skipping external deps\n"
+    );
+    return { ok: false, reason: "cargo-not-found" };
+  }
+
+  if (spawnResult.status === null && spawnResult.signal === "SIGTERM") {
+    process.stderr.write(
+      "reality-map: --follow-deps: cargo metadata timed out (60s) — skipping external deps\n"
+    );
+    return { ok: false, reason: "timeout" };
+  }
+
+  if (spawnResult.status !== 0) {
+    process.stderr.write(
+      "reality-map: --follow-deps: cargo metadata failed — skipping external deps\n"
+    );
+    return { ok: false, reason: "cargo-error", stderr: spawnResult.stderr.toString() };
+  }
+
+  return { ok: true, metadata: JSON.parse(spawnResult.stdout.toString()) };
+}
+
+function extractExternalDeps(metadata) {
+  if (!metadata || !metadata.packages || metadata.packages.length === 0) {
+    return [];
+  }
+
+  const workspaceMemberSet = new Set(metadata.workspace_members || []);
+  const result = [];
+
+  for (const pkg of metadata.packages) {
+    // External = NOT in workspace_members
+    if (workspaceMemberSet.has(pkg.id)) continue;
+
+    // Find best target: prefer lib, fall back to bin
+    const targets = pkg.targets || [];
+    let chosenTarget = targets.find(t => t.kind && t.kind.includes("lib"));
+    if (!chosenTarget) {
+      chosenTarget = targets.find(t => t.kind && t.kind.includes("bin"));
+    }
+    // Skip proc-macro-only, cdylib-only, or packages with no lib/bin target
+    if (!chosenTarget) continue;
+
+    const srcRoot = path.dirname(chosenTarget.src_path);
+    result.push({
+      name: pkg.name,
+      manifestPath: pkg.manifest_path,
+      srcRoot,
+    });
+  }
+
+  return result;
+}
+
+function computeCrateRootFile(manifestDir, parsedManifest) {
+  if (parsedManifest && parsedManifest.lib && parsedManifest.lib.path) {
+    return path.resolve(manifestDir, parsedManifest.lib.path);
+  }
+  if (parsedManifest && parsedManifest.bin && parsedManifest.bin.length > 0 && parsedManifest.bin[0].path) {
+    return path.resolve(manifestDir, parsedManifest.bin[0].path);
+  }
+  const libRs = path.join(manifestDir, "src", "lib.rs");
+  const mainRs = path.join(manifestDir, "src", "main.rs");
+  if (fs.existsSync(libRs)) return libRs;
+  return mainRs;
+}
+
+function mergeExternalDeps(existing, externalDeps, externalFiles) {
+  // existing: { packages: Map, fileToPackage: Map } from discoverCratePackages
+  // externalDeps: [{ name, manifestPath, srcRoot, kind }] from extractExternalDeps
+  // externalFiles: [{ file: absPath, depName: string }] from collectExternalDepFiles
+  // Returns: { packages: Map, fileToPackage: Map } — extended
+
+  const packages = new Map(existing.packages);
+  const fileToPackage = new Map(existing.fileToPackage);
+
+  for (const dep of externalDeps) {
+    // Workspace member with same name wins — don't overwrite
+    if (packages.has(dep.name)) continue;
+
+    const manifestDir = path.dirname(dep.manifestPath);
+    let parsedManifest = null;
+    try {
+      const text = fs.readFileSync(dep.manifestPath, "utf8");
+      parsedManifest = parseCargoToml(text);
+    } catch { /* best-effort */ }
+
+    const rootFile = computeCrateRootFile(manifestDir, parsedManifest);
+
+    packages.set(dep.name, {
+      root: rootFile,
+      manifest: dep.manifestPath,
+      kind: "external-cargo-dep",
+    });
+  }
+
+  for (const { file, depName } of externalFiles) {
+    // Only set if the dep is actually in packages (it might have been skipped due to name collision)
+    if (packages.has(depName)) {
+      fileToPackage.set(file, depName);
+    }
+  }
+
+  return { packages, fileToPackage };
 }
 
 function discoverCratePackages(root, files) {
@@ -771,8 +887,12 @@ function resolveRustImport(fromFile, classifiedSpec, ctx) {
     // First segment is the crate name
     const crateName = segments[0];
     const pkg = cratePackages.get(crateName);
-    // Only resolve if it's a workspace member (or standalone with no workspace)
-    if (!pkg || pkg.kind !== "workspace-member") return null;
+    // Only resolve if it's a workspace member, standalone, or external-cargo-dep
+    if (!pkg) return null;
+    const followable = pkg.kind === "workspace-member"
+      || pkg.kind === "standalone"
+      || pkg.kind === "external-cargo-dep";
+    if (!followable) return null;
     const remainingSegments = segments.slice(1);
     if (remainingSegments.length === 0) {
       // Just the crate root file
@@ -843,4 +963,39 @@ function resolveRustImport(fromFile, classifiedSpec, ctx) {
   return walkSegments(startDir, segments, allFiles);
 }
 
-module.exports = { parseCargoToml, discoverCratePackages, extractRustImports, resolveRustImport };
+function mergeExternalDeps(existing, externalDeps, externalFiles) {
+  // existing: { packages: Map, fileToPackage: Map } from discoverCratePackages
+  // externalDeps: [{ name, manifestPath, srcRoot, kind }] from extractExternalDeps
+  // externalFiles: [{ file: absPath, depName: string }] from collectExternalDepFiles
+  // Returns: { packages: Map, fileToPackage: Map } — extended
+
+  const packages = new Map(existing.packages);
+  const fileToPackage = new Map(existing.fileToPackage);
+
+  for (const dep of externalDeps) {
+    // Workspace member with same name wins — don't overwrite
+    if (packages.has(dep.name)) continue;
+
+    // Compute rootFile: the entry file (lib.rs or main.rs) in srcRoot
+    const libRs = path.join(dep.srcRoot, "lib.rs");
+    const mainRs = path.join(dep.srcRoot, "main.rs");
+    let rootFile;
+    if (fs.existsSync(libRs)) rootFile = libRs;
+    else if (fs.existsSync(mainRs)) rootFile = mainRs;
+    else rootFile = dep.srcRoot; // fallback: use the dir itself
+
+    packages.set(dep.name, {
+      root: rootFile,
+      manifest: dep.manifestPath,
+      kind: "external-cargo-dep",
+    });
+  }
+
+  for (const { file, depName } of externalFiles) {
+    fileToPackage.set(file, depName);
+  }
+
+  return { packages, fileToPackage };
+}
+
+module.exports = { parseCargoToml, extractExternalDeps, discoverCratePackages, extractRustImports, resolveRustImport, runCargoMetadata, mergeExternalDeps };
