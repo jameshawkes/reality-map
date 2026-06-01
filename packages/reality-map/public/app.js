@@ -288,7 +288,7 @@
     const maxLoc = graphMaxLoc(nodes);
     const nodeSizes = new Map(nodes.map((n) => [n.id, nodeVisualSize(n, maxLoc)]));
     const g = new dagre.graphlib.Graph({ multigraph: false, compound: false });
-    g.setGraph({ rankdir: "TB", nodesep: 110, ranksep: 150, marginx: 80, marginy: 80 });
+    g.setGraph({ rankdir: "TB", nodesep: 80, ranksep: 115, marginx: 60, marginy: 60 });
     g.setDefaultEdgeLabel(() => ({}));
     nodes.forEach((n) => {
       const size = nodeSizes.get(n.id);
@@ -344,14 +344,14 @@
         "elk.algorithm": "layered",
         "elk.direction": "DOWN",
         "elk.edgeRouting": "ORTHOGONAL",
-        "elk.padding": "[top=90,left=90,bottom=90,right=90]",
-        "elk.spacing.nodeNode": "130",
-        "elk.spacing.edgeNode": "80",
-        "elk.spacing.edgeEdge": "28",
-        "elk.spacing.componentComponent": "180",
-        "elk.layered.spacing.nodeNodeBetweenLayers": "180",
-        "elk.layered.spacing.edgeNodeBetweenLayers": "90",
-        "elk.layered.spacing.edgeEdgeBetweenLayers": "28",
+        "elk.padding": "[top=70,left=70,bottom=70,right=70]",
+        "elk.spacing.nodeNode": "85",
+        "elk.spacing.edgeNode": "55",
+        "elk.spacing.edgeEdge": "20",
+        "elk.spacing.componentComponent": "120",
+        "elk.layered.spacing.nodeNodeBetweenLayers": "130",
+        "elk.layered.spacing.edgeNodeBetweenLayers": "65",
+        "elk.layered.spacing.edgeEdgeBetweenLayers": "20",
         "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF",
         "elk.layered.crossingMinimization.strategy": "LAYER_SWEEP",
         "elk.layered.cycleBreaking.strategy": "GREEDY",
