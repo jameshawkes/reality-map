@@ -156,7 +156,7 @@
   }
 
   // ── Phase 3: layout algorithms ────────────────────────────────
-  // "server" | "radial" | "force" | "dagre" | "elk"
+  // "server" | "radial" | "force" | "links" | "dagre" | "elk"
   const NODE_BASE_W = 220;
   const NODE_BASE_H = 88;
 
@@ -195,10 +195,11 @@
   // Dagre is synchronous and cheap; the render-path lazy-fill will
   // compute layoutPositions.dagre on first draw, so no init action needed here.
   // Store computed positions per layout so switching is instant
-  const layoutPositions = { server: null, radial: null, force: null, dagre: null, elk: null };
+  const layoutPositions = { server: null, radial: null, force: null, links: null, dagre: null, elk: null };
   function invalidateLayoutPositions() {
     layoutPositions.radial = null;
     layoutPositions.force = null;
+    layoutPositions.links = null;
     layoutPositions.dagre = null;
     layoutPositions.elk = null;
   }
@@ -279,6 +280,170 @@
     const minY = Math.min(...pos.map((p) => p.y));
     pos.forEach((p) => {
       positions.set(p.id, { x: Math.round(p.x - minX + 60), y: Math.round(p.y - minY + 60) });
+    });
+    return positions;
+  }
+
+  function computeLinksPositions(nodes, edges) {
+    const positions = new Map();
+    const n = nodes.length;
+    if (!n) return positions;
+
+    const maxLoc = graphMaxLoc(nodes);
+    const nodeSizes = new Map(nodes.map((node) => [node.id, nodeVisualSize(node, maxLoc)]));
+    const safeEdges = edges.filter((e) => nodes.some((x) => x.id === e.source) && nodes.some((x) => x.id === e.target));
+
+    // Seed from the currently-known positions. That keeps the first movement
+    // intuitive when switching from layered/ELK, then the simulation pulls
+    // highly-coupled modules close together to reduce arrow length.
+    const pos = nodes.map((node, i) => {
+      const size = nodeSizes.get(node.id) || { width: NODE_BASE_W, height: NODE_BASE_H };
+      const fallbackAngle = (2 * Math.PI * i) / Math.max(1, n);
+      const fallbackR = Math.max(260, n * 38);
+      const x = Number.isFinite(node.x) ? node.x + size.width / 2 : 600 + Math.cos(fallbackAngle) * fallbackR;
+      const y = Number.isFinite(node.y) ? node.y + size.height / 2 : 420 + Math.sin(fallbackAngle) * fallbackR;
+      return { id: node.id, x, y, vx: 0, vy: 0, width: size.width, height: size.height };
+    });
+    const byId = new Map(pos.map((p) => [p.id, p]));
+
+    // Small directed bias: sources should tend to sit above targets, but this
+    // is intentionally weaker than the edge-length spring. Traceability wins
+    // over a perfect top-to-bottom hierarchy in this layout.
+    const indegree = new Map(pos.map((p) => [p.id, 0]));
+    safeEdges.forEach((e) => indegree.set(e.target, (indegree.get(e.target) || 0) + 1));
+    const roots = pos.filter((p) => (indegree.get(p.id) || 0) === 0);
+    const rootY = Math.min(...pos.map((p) => p.y));
+    roots.forEach((p, i) => {
+      p.y = rootY + (i % 3) * 28;
+    });
+
+    const ITER = 320;
+    const BASE_LINK = 255;
+    const REPULSE = 18000;
+    const EDGE_K = 0.025;
+    const OVERLAP_K = 0.22;
+    const DOWN_K = 0.018;
+    const DAMP = 0.76;
+    const NODE_GAP_X = 54;
+    const NODE_GAP_Y = 44;
+
+    for (let iter = 0; iter < ITER; iter++) {
+      const cooling = 1 - iter / ITER;
+
+      // Pairwise repulsion and explicit rectangle-overlap avoidance.
+      for (let i = 0; i < pos.length; i++) {
+        for (let j = i + 1; j < pos.length; j++) {
+          const a = pos[i], b = pos[j];
+          let dx = b.x - a.x;
+          let dy = b.y - a.y;
+          if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) { dx = 0.1; dy = 0.1; }
+          const dist2 = dx * dx + dy * dy;
+          const dist = Math.sqrt(dist2) || 1;
+          const nx = dx / dist, ny = dy / dist;
+
+          const push = (REPULSE / Math.max(dist2, 1600)) * cooling;
+          a.vx -= nx * push;
+          a.vy -= ny * push;
+          b.vx += nx * push;
+          b.vy += ny * push;
+
+          const minX = (a.width + b.width) / 2 + NODE_GAP_X;
+          const minY = (a.height + b.height) / 2 + NODE_GAP_Y;
+          const overlapX = minX - Math.abs(dx);
+          const overlapY = minY - Math.abs(dy);
+          if (overlapX > 0 && overlapY > 0) {
+            if (overlapX < overlapY) {
+              const sx = dx >= 0 ? 1 : -1;
+              a.vx -= sx * overlapX * OVERLAP_K;
+              b.vx += sx * overlapX * OVERLAP_K;
+            } else {
+              const sy = dy >= 0 ? 1 : -1;
+              a.vy -= sy * overlapY * OVERLAP_K;
+              b.vy += sy * overlapY * OVERLAP_K;
+            }
+          }
+        }
+      }
+
+      // Edge springs: this is the primary objective. Heavy edges get slightly
+      // shorter desired lengths because they represent repeated coupling.
+      safeEdges.forEach((e) => {
+        const a = byId.get(e.source), b = byId.get(e.target);
+        if (!a || !b) return;
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+        dx /= dist; dy /= dist;
+        const weight = Math.max(1, e.weight || 1);
+        const desired = Math.max(160, BASE_LINK - Math.min(70, Math.log2(weight + 1) * 22));
+        const force = (dist - desired) * EDGE_K;
+        a.vx += dx * force;
+        a.vy += dy * force;
+        b.vx -= dx * force;
+        b.vy -= dy * force;
+
+        const minDown = 70;
+        const dyRaw = b.y - a.y;
+        if (dyRaw < minDown) {
+          const f = (minDown - dyRaw) * DOWN_K * cooling;
+          a.vy -= f;
+          b.vy += f;
+        }
+      });
+
+      // Gentle centering keeps disconnected pieces from drifting forever.
+      const cx = pos.reduce((s, p) => s + p.x, 0) / pos.length;
+      const cy = pos.reduce((s, p) => s + p.y, 0) / pos.length;
+      pos.forEach((p) => {
+        p.vx += (600 - cx) * 0.001;
+        p.vy += (420 - cy) * 0.001;
+        const maxStep = 26 * cooling + 5;
+        p.vx = Math.max(-maxStep, Math.min(maxStep, p.vx));
+        p.vy = Math.max(-maxStep, Math.min(maxStep, p.vy));
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vx *= DAMP;
+        p.vy *= DAMP;
+      });
+    }
+
+    // Deterministic final untangle pass. Keep it modest: if two cards still
+    // collide, separate them along the smaller axis without throwing away the
+    // edge-length-optimized neighbourhoods.
+    for (let pass = 0; pass < 60; pass++) {
+      let moved = false;
+      for (let i = 0; i < pos.length; i++) {
+        for (let j = i + 1; j < pos.length; j++) {
+          const a = pos[i], b = pos[j];
+          const dx = b.x - a.x || 0.1;
+          const dy = b.y - a.y || 0.1;
+          const minX = (a.width + b.width) / 2 + NODE_GAP_X * 0.75;
+          const minY = (a.height + b.height) / 2 + NODE_GAP_Y * 0.75;
+          const overlapX = minX - Math.abs(dx);
+          const overlapY = minY - Math.abs(dy);
+          if (overlapX <= 0 || overlapY <= 0) continue;
+          moved = true;
+          if (overlapX < overlapY) {
+            const sx = dx >= 0 ? 1 : -1;
+            a.x -= sx * overlapX * 0.5;
+            b.x += sx * overlapX * 0.5;
+          } else {
+            const sy = dy >= 0 ? 1 : -1;
+            a.y -= sy * overlapY * 0.5;
+            b.y += sy * overlapY * 0.5;
+          }
+        }
+      }
+      if (!moved) break;
+    }
+
+    const minLeft = Math.min(...pos.map((p) => p.x - p.width / 2));
+    const minTop = Math.min(...pos.map((p) => p.y - p.height / 2));
+    pos.forEach((p) => {
+      positions.set(p.id, {
+        x: Math.round(p.x - p.width / 2 - minLeft + 70),
+        y: Math.round(p.y - p.height / 2 - minTop + 70),
+      });
     });
     return positions;
   }
@@ -416,6 +581,7 @@
     if (layout !== "server" && currentViewGraph) {
       if (layout === "radial") layoutPositions.radial = computeRadialPositions(currentViewGraph.nodes);
       if (layout === "force") layoutPositions.force = computeForcePositions(currentViewGraph.nodes, currentViewGraph.edges);
+      if (layout === "links") layoutPositions.links = computeLinksPositions(currentViewGraph.nodes, currentViewGraph.edges);
       if (layout === "dagre") layoutPositions.dagre = computeDagrePositions(currentViewGraph.nodes, currentViewGraph.edges);
     }
     document.querySelectorAll(".layout-btn").forEach((b) => {
@@ -1251,6 +1417,8 @@
       layoutPositions.radial = computeRadialPositions(graph.nodes);
     if (currentLayout === "force" && !layoutPositions.force)
       layoutPositions.force = computeForcePositions(graph.nodes, graph.edges);
+    if (currentLayout === "links" && !layoutPositions.links)
+      layoutPositions.links = computeLinksPositions(graph.nodes, graph.edges);
     if (currentLayout === "dagre" && !layoutPositions.dagre)
       layoutPositions.dagre = computeDagrePositions(graph.nodes, graph.edges);
     // Note: elk is NOT auto-triggered here — it's async and heavy; user must click the elk button.
