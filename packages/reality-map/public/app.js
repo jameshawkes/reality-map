@@ -156,7 +156,35 @@
   }
 
   // ── Phase 3: layout algorithms ────────────────────────────────
-  // "server" | "radial" | "force"
+  // "server" | "radial" | "force" | "dagre" | "elk"
+  const NODE_BASE_W = 220;
+  const NODE_BASE_H = 88;
+
+  function graphMaxLoc(nodes) {
+    return Math.max(...nodes.map((n) => n.loc || 0), 1);
+  }
+
+  function nodeVisualSize(node, maxLoc) {
+    return {
+      width: NODE_BASE_W + Math.min(60, ((node.loc || 0) / maxLoc) * 100),
+      height: NODE_BASE_H + Math.min(40, ((node.loc || 0) / maxLoc) * 60),
+    };
+  }
+
+  function edgeKey(e) {
+    return `${e.source}\u0000${e.target}`;
+  }
+
+  function getLayoutPositions(entry) {
+    if (!entry) return null;
+    return entry instanceof Map ? entry : entry.positions;
+  }
+
+  function edgeRouteToPath(points) {
+    if (!points || points.length < 2) return null;
+    return points.map((p, i) => `${i === 0 ? "M" : "L"}${p.x},${p.y}`).join(" ");
+  }
+
   let currentLayout = localStorage.getItem("rm-layout") || "server";
   // Elk requires a 1.5MB script-inject + async compute; don't auto-fire on tab open.
   // Downgrade silently to server; the user can re-click elk if they want it.
@@ -176,7 +204,7 @@
   }
 
   function applyLayout(graph) {
-    const positions = layoutPositions[currentLayout];
+    const positions = getLayoutPositions(layoutPositions[currentLayout]);
     if (!positions || currentLayout === "server") return graph;
     return {
       ...graph,
@@ -257,20 +285,26 @@
 
   function computeDagrePositions(nodes, edges) {
     if (!nodes.length) return new Map();
-    const NW = 220, NH = 88;
+    const maxLoc = graphMaxLoc(nodes);
+    const nodeSizes = new Map(nodes.map((n) => [n.id, nodeVisualSize(n, maxLoc)]));
     const g = new dagre.graphlib.Graph({ multigraph: false, compound: false });
-    g.setGraph({ rankdir: "TB", nodesep: 60, ranksep: 90, marginx: 40, marginy: 40 });
+    g.setGraph({ rankdir: "TB", nodesep: 110, ranksep: 150, marginx: 80, marginy: 80 });
     g.setDefaultEdgeLabel(() => ({}));
-    nodes.forEach((n) => g.setNode(n.id, { width: NW, height: NH }));
+    nodes.forEach((n) => {
+      const size = nodeSizes.get(n.id);
+      g.setNode(n.id, { width: size.width, height: size.height });
+    });
     edges.forEach((e) => g.setEdge(e.source, e.target));
     console.time("rm-dagre");
     dagre.layout(g);
     console.timeEnd("rm-dagre");
     const positions = new Map();
-    // dagre returns centre coords; convert to top-left: x - NW/2, y - NH/2
+    // dagre returns centre coords; convert to top-left using the same visual
+    // node size the SVG renderer uses. Otherwise larger LOC cards can overlap.
     g.nodes().forEach((id) => {
       const { x, y } = g.node(id);
-      positions.set(id, { x: Math.round(x - NW / 2), y: Math.round(y - NH / 2) });
+      const size = nodeSizes.get(id) || { width: NODE_BASE_W, height: NODE_BASE_H };
+      positions.set(id, { x: Math.round(x - size.width / 2), y: Math.round(y - size.height / 2) });
     });
     return positions;
   }
@@ -294,19 +328,39 @@
   }
 
   async function computeElkPositions(nodes, edges) {
-    if (!nodes.length) return new Map();
-    const NW = 220, NH = 88;
+    if (!nodes.length) return { positions: new Map(), edgeRoutes: new Map() };
+    const maxLoc = graphMaxLoc(nodes);
+    const nodeSizes = new Map(nodes.map((n) => [n.id, nodeVisualSize(n, maxLoc)]));
     const elk = await loadElk();
+    const edgeKeyByElkId = new Map();
+    const elkEdges = edges.map((e, i) => {
+      const id = `e${i}`;
+      edgeKeyByElkId.set(id, edgeKey(e));
+      return { id, sources: [e.source], targets: [e.target] };
+    });
     const graph = {
       id: "root",
       layoutOptions: {
         "elk.algorithm": "layered",
         "elk.direction": "DOWN",
-        "elk.layered.spacing.nodeNodeBetweenLayers": "80",
-        "elk.spacing.nodeNode": "40",
+        "elk.edgeRouting": "ORTHOGONAL",
+        "elk.padding": "[top=90,left=90,bottom=90,right=90]",
+        "elk.spacing.nodeNode": "130",
+        "elk.spacing.edgeNode": "80",
+        "elk.spacing.edgeEdge": "28",
+        "elk.spacing.componentComponent": "180",
+        "elk.layered.spacing.nodeNodeBetweenLayers": "180",
+        "elk.layered.spacing.edgeNodeBetweenLayers": "90",
+        "elk.layered.spacing.edgeEdgeBetweenLayers": "28",
+        "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF",
+        "elk.layered.crossingMinimization.strategy": "LAYER_SWEEP",
+        "elk.layered.cycleBreaking.strategy": "GREEDY",
       },
-      children: nodes.map((n) => ({ id: n.id, width: NW, height: NH })),
-      edges: edges.map((e, i) => ({ id: `e${i}`, sources: [e.source], targets: [e.target] })),
+      children: nodes.map((n) => {
+        const size = nodeSizes.get(n.id);
+        return { id: n.id, width: size.width, height: size.height };
+      }),
+      edges: elkEdges,
     };
     console.time("rm-elk");
     const laid = await elk.layout(graph);
@@ -316,7 +370,20 @@
       // ELK returns top-left coords; n.x/n.y are also top-left → no conversion needed
       positions.set(c.id, { x: Math.round(c.x), y: Math.round(c.y) });
     }
-    return positions;
+    const edgeRoutes = new Map();
+    for (const edge of laid.edges || []) {
+      const section = edge.sections && edge.sections[0];
+      if (!section || !section.startPoint || !section.endPoint) continue;
+      const points = [
+        section.startPoint,
+        ...(section.bendPoints || []),
+        section.endPoint,
+      ].map((p) => ({ x: Math.round(p.x), y: Math.round(p.y) }));
+      const key = edgeKeyByElkId.get(edge.id)
+        || (edge.sources && edge.targets ? `${edge.sources[0]}\u0000${edge.targets[0]}` : edge.id);
+      edgeRoutes.set(key, points);
+    }
+    return { positions, edgeRoutes };
   }
 
   function switchLayout(layout) {
@@ -419,6 +486,48 @@
     invalidateLayoutPositions();
     render();
   });
+
+  function filterModules(nodes) {
+    const q = (moduleFilter.value || "").trim().toLowerCase();
+    if (!q) return nodes;
+    return nodes.filter((n) => {
+      const haystack = [
+        n.id,
+        n.label,
+        ...(n.pathsPreview || []),
+      ].join("\n").toLowerCase();
+      return haystack.includes(q);
+    });
+  }
+
+  function sortModules(nodes) {
+    const mode = moduleSort.value || "loc";
+    const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+    const sorted = [...nodes];
+    sorted.sort((a, b) => {
+      if (mode === "name") return collator.compare(a.label || a.id, b.label || b.id);
+      if (mode === "fanIn") return ((b.fanIn || 0) - (a.fanIn || 0)) || collator.compare(a.label || a.id, b.label || b.id);
+      if (mode === "fanOut") return ((b.fanOut || 0) - (a.fanOut || 0)) || collator.compare(a.label || a.id, b.label || b.id);
+      return ((b.loc || 0) - (a.loc || 0)) || collator.compare(a.label || a.id, b.label || b.id);
+    });
+    return sorted;
+  }
+
+  function renderArchHealth(graph) {
+    const wrap = document.getElementById("arch-health");
+    if (!wrap) return;
+    const cycles = graph.cycles?.length ?? graph.stats?.cycles ?? 0;
+    const hubs = graph.nodes.filter((n) => (n.fanIn || 0) >= 8 && (n.fanOut || 0) >= 5).length;
+    const warnNodes = graph.nodes.filter((n) => n.warn).length;
+    const isolated = graph.nodes.filter((n) => (n.fanIn || 0) === 0 && (n.fanOut || 0) === 0).length;
+    const rows = [
+      { label: cycles ? `${cycles} cycle${cycles === 1 ? "" : "s"}` : "no cycles", tone: cycles ? TONE.rose : TONE.emerald },
+      { label: hubs ? `${hubs} hub${hubs === 1 ? "" : "s"}` : "no hubs", tone: hubs ? TONE.amber : TONE.emerald },
+      { label: warnNodes ? `${warnNodes} warned module${warnNodes === 1 ? "" : "s"}` : "no warnings", tone: warnNodes ? TONE.rose : TONE.emerald },
+      { label: isolated ? `${isolated} isolated module${isolated === 1 ? "" : "s"}` : "no isolated modules", tone: isolated ? TONE.amber : TONE.emerald },
+    ];
+    wrap.innerHTML = rows.map((r) => `<div class="row"><span class="dot" style="background:${r.tone}"></span><span class="name">${r.label}</span></div>`).join("");
+  }
 
   moduleSort.addEventListener("change", () => render());
   moduleFilter.addEventListener("input", () => render());
@@ -1031,9 +1140,13 @@
       render();
       showModuleDrawer(moduleId);
     }
+  }
+
+  function updateDetailPanel(graph) {
     const n = graph.nodes.find((x) => x.id === selected);
     if (!n) {
       detailPanel.textContent = "—";
+      detailPanel.className = "detail mono dim";
       return;
     }
     const lines = [
@@ -1371,11 +1484,9 @@
     const rootG = el("g", { transform: `translate(${view.x} ${view.y}) scale(${view.k})` });
     svg.appendChild(rootG);
 
-    const NW = 220,
-      NH = 88;
-
-    // Find max LOC for scaling
-    const maxLoc = Math.max(...graph.nodes.map((n) => n.loc), 1);
+    // Find max LOC for visual node sizing. Layout engines use this same helper
+    // so the cards they reserve space for match the cards we draw.
+    const maxLoc = graphMaxLoc(graph.nodes);
 
     // Activity / Blast state
     const now = Date.now() / 1000;
@@ -1384,6 +1495,7 @@
     let blastSet = mapMode === "blast" ? getBlastRadius(selected, graph) : new Set();
 
     const byId = new Map(graph.nodes.map((n) => [n.id, n]));
+    const elkEdgeRoutes = currentLayout === "elk" ? layoutPositions.elk?.edgeRoutes : null;
 
     const edgesG = el("g");
     graph.edges.forEach((e) => {
@@ -1395,17 +1507,21 @@
       if (!edgePassesFilter(e, byId)) return;
 
       // Get source/target node dimensions
-      const aW = NW + Math.min(60, (a.loc / maxLoc) * 100);
-      const aH = NH + Math.min(40, (a.loc / maxLoc) * 60);
-      const bW = NW + Math.min(60, (b.loc / maxLoc) * 100);
-      const bH = NH + Math.min(40, (b.loc / maxLoc) * 60);
+      const aSize = nodeVisualSize(a, maxLoc);
+      const bSize = nodeVisualSize(b, maxLoc);
+      const aW = aSize.width;
+      const aH = aSize.height;
+      const bW = bSize.width;
+      const bH = bSize.height;
 
       // Exit from the side of source that faces the target, prefer horizontal if dx >= dy
       const aCx = a.x + aW / 2, aCy = a.y + aH / 2;
       const bCx = b.x + bW / 2, bCy = b.y + bH / 2;
       const rawDx = bCx - aCx, rawDy = bCy - aCy;
       let x1, y1, x2, y2, d;
-      if (Math.abs(rawDx) >= Math.abs(rawDy) * 0.6) {
+      const elkRoute = elkEdgeRoutes?.get(edgeKey(e));
+      d = edgeRouteToPath(elkRoute);
+      if (!d && Math.abs(rawDx) >= Math.abs(rawDy) * 0.6) {
         // Horizontal exit/entry
         x1 = rawDx >= 0 ? a.x + aW : a.x;
         y1 = aCy;
@@ -1414,7 +1530,7 @@
         const ctrl = Math.max(50, Math.abs(x2 - x1) * 0.45 + Math.abs(y2 - y1) * 0.1);
         const sx = x2 >= x1 ? 1 : -1;
         d = `M${x1},${y1} C${x1+sx*ctrl},${y1} ${x2-sx*ctrl},${y2} ${x2},${y2}`;
-      } else {
+      } else if (!d) {
         // Vertical exit/entry — use center-X, exit bottom or top
         x1 = aCx;
         y1 = rawDy >= 0 ? a.y + aH : a.y;
@@ -1459,8 +1575,6 @@
     });
     rootG.appendChild(edgesG);
 
-    const barMax = Math.max(...graph.nodes.map((m) => m.loc), 1);
-
     graph.nodes.forEach((n) => {
       const g = el("g", { class: "node-group", transform: `translate(${n.x} ${n.y})` });
       g.dataset.id = n.id;
@@ -1469,10 +1583,9 @@
       const accentColor = getModuleColor(n, mapMode, blastSet);
 
       // Scaling based on LOC
-      const extraW = Math.min(60, (n.loc / maxLoc) * 100);
-      const extraH = Math.min(40, (n.loc / maxLoc) * 60);
-      const curW = NW + extraW;
-      const curH = NH + extraH;
+      const nodeSize = nodeVisualSize(n, maxLoc);
+      const curW = nodeSize.width;
+      const curH = nodeSize.height;
 
       const labelTxt = n.label.length > 22 ? n.label.slice(0, 20) + "…" : n.label;
       const subTxt = n.sub ?? "";
