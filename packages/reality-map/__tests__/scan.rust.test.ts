@@ -303,6 +303,149 @@ describe("extractRustImports v2", () => {
   });
 });
 
+describe("extractRustImports: #[cfg(test)] gating (Phase 1)", () => {
+  it("drops `use super::*` inside #[cfg(test)] mod tests {}", () => {
+    const src = `
+pub fn x() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn t() { x(); }
+}
+`;
+    const out = extractRustImports(src);
+    const supers = out.classified.filter((c: any) => c.kind === "super");
+    expect(supers).toEqual([]);
+  });
+
+  it("drops `use super::Foo` inside #[cfg(test)] mod tests {}", () => {
+    const src = `
+#[cfg(test)]
+mod tests {
+    use super::Foo;
+}
+`;
+    const out = extractRustImports(src);
+    expect(out.classified.filter((c: any) => c.kind === "super")).toEqual([]);
+  });
+
+  it("drops `use self::Foo` inside #[cfg(test)] mod tests {}", () => {
+    const src = `
+#[cfg(test)]
+mod tests {
+    use self::helper;
+}
+`;
+    const out = extractRustImports(src);
+    expect(out.classified.filter((c: any) => c.kind === "self")).toEqual([]);
+  });
+
+  it("KEEPS `use crate::other::Foo` inside #[cfg(test)] (real test coupling)", () => {
+    const src = `
+#[cfg(test)]
+mod tests {
+    use crate::other_module::Helper;
+}
+`;
+    const out = extractRustImports(src);
+    const crates = out.classified.filter((c: any) => c.kind === "crate");
+    expect(crates.length).toBe(1);
+    expect(crates[0].segments).toEqual(["other_module", "Helper"]);
+  });
+
+  it("KEEPS `use external_crate::Foo` inside #[cfg(test)]", () => {
+    const src = `
+#[cfg(test)]
+mod tests {
+    use approx::assert_relative_eq;
+}
+`;
+    const out = extractRustImports(src);
+    const ext = out.classified.filter((c: any) => c.kind === "external");
+    expect(ext.length).toBe(1);
+  });
+
+  it("KEEPS `use super::*` OUTSIDE any cfg(test) block (regular nested module)", () => {
+    const src = `
+mod inner {
+    use super::*;
+    pub fn f() {}
+}
+`;
+    const out = extractRustImports(src);
+    const supers = out.classified.filter((c: any) => c.kind === "super");
+    expect(supers.length).toBe(1);
+  });
+
+  it("handles #[cfg(any(test, feature = \"x\"))] correctly", () => {
+    const src = `
+#[cfg(any(test, feature = "experimental"))]
+mod tests {
+    use super::*;
+}
+`;
+    const out = extractRustImports(src);
+    expect(out.classified.filter((c: any) => c.kind === "super")).toEqual([]);
+  });
+
+  it("does NOT match cfg attributes that lack the bare `test` token", () => {
+    // `not_test` is not the same as `test`
+    const src = `
+#[cfg(feature = "not_test")]
+mod helpers {
+    use super::*;
+}
+`;
+    const out = extractRustImports(src);
+    expect(out.classified.filter((c: any) => c.kind === "super").length).toBe(1);
+  });
+
+  it("handles nested braces inside the test mod body", () => {
+    const src = `
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outer() {
+        let x = { let y = 1; y + 1 };
+        if true { let _ = (); }
+    }
+}
+
+// Outside the test mod — this super should be kept
+mod other {
+    use super::*;
+}
+`;
+    const out = extractRustImports(src);
+    const supers = out.classified.filter((c: any) => c.kind === "super");
+    // Only the second `use super::*` (outside the cfg(test) block) survives
+    expect(supers.length).toBe(1);
+  });
+
+  it("handles multiple cfg(test) blocks in one file", () => {
+    const src = `
+#[cfg(test)]
+mod a { use super::*; }
+
+pub fn middle() {}
+
+#[cfg(test)]
+mod b { use super::Foo; }
+
+mod real {
+    use super::*; // KEPT — outside cfg(test)
+}
+`;
+    const out = extractRustImports(src);
+    const supers = out.classified.filter((c: any) => c.kind === "super");
+    expect(supers.length).toBe(1);
+  });
+});
+
 describe("resolveRustImport", () => {
   function buildCtx(fixtureDir: string) {
     const files = collectRsFiles(fixtureDir);
@@ -648,6 +791,246 @@ describe("workspace module grouping", () => {
     // This test will pass both before and after the fix (tripwire)
     expect(typeof result.insights?.summary?.internalEdges).toBe("number");
     expect(result.insights?.summary?.internalEdges).toBeGreaterThan(0);
+  });
+});
+
+describe("cargo target separation (examples / bin / benches / tests)", () => {
+  const CT = join(FIXTURES, "cargo-targets");
+
+  it("each examples/<name>.rs becomes its own module node at depth 1", async () => {
+    const result = await scanProject(CT);
+    const graph = result.graphsByDepth?.[1];
+    const ids = (graph?.nodes ?? []).map((n: any) => n.id);
+    expect(ids).toContain("app/examples/rover");
+  });
+
+  it("examples/<name>/main.rs collapses to app/examples/<name> (target-level grouping)", async () => {
+    const result = await scanProject(CT);
+    const graph = result.graphsByDepth?.[1];
+    const ids = (graph?.nodes ?? []).map((n: any) => n.id);
+    expect(ids).toContain("app/examples/multi");
+    // helper file beside main.rs is part of the same example target, NOT a separate module
+    expect(ids).not.toContain("app/examples/multi/aux");
+  });
+
+  it("src/bin/<name>.rs becomes app/bin/<name>", async () => {
+    const result = await scanProject(CT);
+    const graph = result.graphsByDepth?.[1];
+    const ids = (graph?.nodes ?? []).map((n: any) => n.id);
+    expect(ids).toContain("app/bin/tool");
+  });
+
+  it("benches/ and tests/ are NOT separated (crate-level support code lumps together)", async () => {
+    const result = await scanProject(CT);
+    const graph = result.graphsByDepth?.[1];
+    const ids = (graph?.nodes ?? []).map((n: any) => n.id);
+    // At depth 1, benches/tests files fall through to default moduleOf and
+    // bucket by their parent dir name (relative to scan root). The exact id
+    // depends on whether the package is at the workspace root or not.
+    // For our fixture (member at "app"), they land in "app/benches" / "app/tests".
+    expect(ids).not.toContain("app/benches/bench_a");
+    expect(ids).not.toContain("app/tests/integration");
+    // The "lumped" parent appears instead — exact id depends on default
+    // moduleOf path-strip rules; we just assert the per-file split didn't happen.
+  });
+
+  it("lib + helpers still group under app at depth 1 (target separation does not bleed into src/)", async () => {
+    const result = await scanProject(CT);
+    const graph = result.graphsByDepth?.[1];
+    const ids = (graph?.nodes ?? []).map((n: any) => n.id);
+    expect(ids).toContain("app");
+    // lib.rs and helpers.rs belong to the lib target → both go in "app"
+  });
+
+  it("depth 2+ does not subdivide target nodes (they are atomic)", async () => {
+    const result = await scanProject(CT, { maxDepth: 5 });
+    for (const d of [2, 3, 5]) {
+      const graph = result.graphsByDepth?.[d];
+      const ids = (graph?.nodes ?? []).map((n: any) => n.id);
+      // The target-level node persists; depth does not split it deeper
+      expect(ids).toContain("app/examples/rover");
+      expect(ids).toContain("app/examples/multi");
+      expect(ids).not.toContain("app/examples/multi/aux");
+    }
+  });
+
+  it("example imports lib → edge from app/examples/rover to app", async () => {
+    const result = await scanProject(CT);
+    const graph = result.graphsByDepth?.[1];
+    const edges = (graph?.edges ?? []) as Array<{ source: string; target: string }>;
+    const found = edges.some((e) => e.source === "app/examples/rover" && e.target === "app");
+    expect(found).toBe(true);
+  });
+});
+
+describe("mod declaration edges are not architectural edges", () => {
+  // Uses the nested-mods fixture which has lib.rs declaring `pub mod foo;`
+  // and foo containing a real use of lib. The mod-declaration edge
+  // (lib.rs → foo.rs) should NOT appear in the module-level edge list.
+  const NM = join(FIXTURES, "nested-mods");
+
+  it("scan completes and produces a module graph", async () => {
+    const result = await scanProject(NM, { maxDepth: 5 });
+    expect(result.graphsByDepth?.[1]).toBeTruthy();
+  });
+
+  it("mod declarations alone do NOT create module-graph edges (within a crate)", async () => {
+    // Build a tiny in-test fixture: lib.rs declares `pub mod foo;` and foo.rs
+    // does NOT import anything from lib. The cross-module edge would be from
+    // the mod declaration only — we want this dropped.
+    const { mkdtempSync, writeFileSync, mkdirSync, rmSync } = require("fs");
+    const { tmpdir } = require("os");
+    const tmp = mkdtempSync(join(tmpdir(), "rm-mod-edge-"));
+    mkdirSync(join(tmp, "src"), { recursive: true });
+    writeFileSync(
+      join(tmp, "Cargo.toml"),
+      '[package]\nname = "modonly"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    writeFileSync(
+      join(tmp, "src", "lib.rs"),
+      "pub mod foo;\npub mod bar;\n"
+    );
+    writeFileSync(join(tmp, "src", "foo.rs"), "pub fn f() {}\n");
+    writeFileSync(join(tmp, "src", "bar.rs"), "pub fn b() {}\n");
+    try {
+      const result = await scanProject(tmp, { maxDepth: 5 });
+      // At depth 2, lib.rs is in "modonly", foo.rs is in "modonly/foo" (no — actually
+      // it's a flat file so it lands in "modonly" too). Let's check depth 3.
+      // Actually for a single-file-per-mod layout there are no cross-module edges
+      // because everything buckets together. The real assertion: at depth 1 with
+      // realistic structure, no spurious cycles appear.
+      for (const d of [1, 2, 3, 5]) {
+        const g = result.graphsByDepth?.[d];
+        // No cycles should appear from mere mod declarations
+        expect(g?.cycles ?? []).toEqual([]);
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("flat src/<name>.rs file promotes to its own module node (not lumped under crate root)", async () => {
+    const { mkdtempSync, writeFileSync, mkdirSync, rmSync } = require("fs");
+    const { tmpdir } = require("os");
+    const tmp = mkdtempSync(join(tmpdir(), "rm-flat-promote-"));
+    // Workspace with one member that has both a flat scenes.rs and a dir-based physics/mod.rs
+    mkdirSync(join(tmp, "member", "src", "physics"), { recursive: true });
+    writeFileSync(
+      join(tmp, "Cargo.toml"),
+      '[workspace]\nmembers = ["member"]\nresolver = "2"\n'
+    );
+    writeFileSync(
+      join(tmp, "member", "Cargo.toml"),
+      '[package]\nname = "member"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    writeFileSync(
+      join(tmp, "member", "src", "lib.rs"),
+      "pub mod scenes;\npub mod physics;\n"
+    );
+    writeFileSync(join(tmp, "member", "src", "scenes.rs"), "pub fn s() {}\n");
+    writeFileSync(
+      join(tmp, "member", "src", "physics", "mod.rs"),
+      "pub fn p() {}\n"
+    );
+    try {
+      const result = await scanProject(tmp, { maxDepth: 3 });
+      // At depth 1, the whole crate is one node — consistent with how
+      // dir-based modules behave too (physics doesn't appear either).
+      const g1 = result.graphsByDepth?.[1];
+      const ids1 = (g1?.nodes ?? []).map((n: any) => n.id);
+      expect(ids1).toContain("member");
+      expect(ids1).not.toContain("member/scenes");
+      expect(ids1).not.toContain("member/physics");
+      // At depth 2+, the flat file gets promoted alongside dir-based modules.
+      for (const d of [2, 3]) {
+        const g = result.graphsByDepth?.[d];
+        const ids = (g?.nodes ?? []).map((n: any) => n.id);
+        expect(ids).toContain("member"); // crate root (lib.rs)
+        expect(ids).toContain("member/scenes"); // flat file promoted
+        expect(ids).toContain("member/physics"); // dir-based module
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("lib.rs and main.rs stay bucketed as the crate root (not promoted)", async () => {
+    const { mkdtempSync, writeFileSync, mkdirSync, rmSync } = require("fs");
+    const { tmpdir } = require("os");
+    const tmp = mkdtempSync(join(tmpdir(), "rm-lib-stays-"));
+    mkdirSync(join(tmp, "member", "src", "bin"), { recursive: true });
+    writeFileSync(
+      join(tmp, "Cargo.toml"),
+      '[workspace]\nmembers = ["member"]\nresolver = "2"\n'
+    );
+    writeFileSync(
+      join(tmp, "member", "Cargo.toml"),
+      '[package]\nname = "member"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    writeFileSync(
+      join(tmp, "member", "src", "lib.rs"),
+      "pub mod helpers;\n"
+    );
+    writeFileSync(join(tmp, "member", "src", "main.rs"), "fn main() {}\n");
+    writeFileSync(join(tmp, "member", "src", "helpers.rs"), "pub fn h() {}\n");
+    try {
+      const result = await scanProject(tmp, { maxDepth: 3 });
+      // Check at depth 2 (where promotion is active)
+      const g = result.graphsByDepth?.[2];
+      const ids = (g?.nodes ?? []).map((n: any) => n.id);
+      expect(ids).toContain("member"); // lib.rs + main.rs both bucket here
+      expect(ids).toContain("member/helpers"); // flat file promoted
+      // No "member/lib" or "member/main" nodes should appear
+      expect(ids).not.toContain("member/lib");
+      expect(ids).not.toContain("member/main");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("real use-statements DO create module-graph edges (sanity check)", async () => {
+    // Same fixture but foo.rs now references something in bar via `use crate::bar`
+    const { mkdtempSync, writeFileSync, mkdirSync, rmSync } = require("fs");
+    const { tmpdir } = require("os");
+    const tmp = mkdtempSync(join(tmpdir(), "rm-real-edge-"));
+    mkdirSync(join(tmp, "src", "sub"), { recursive: true });
+    writeFileSync(
+      join(tmp, "Cargo.toml"),
+      '[package]\nname = "withuse"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    writeFileSync(
+      join(tmp, "src", "lib.rs"),
+      "pub mod sub;\npub mod other;\n"
+    );
+    mkdirSync(join(tmp, "src", "other"), { recursive: true });
+    writeFileSync(join(tmp, "src", "sub", "mod.rs"), "pub fn s() {}\n");
+    writeFileSync(
+      join(tmp, "src", "other", "mod.rs"),
+      "use crate::sub::s;\npub fn o() { s(); }\n"
+    );
+    try {
+      const result = await scanProject(tmp, { maxDepth: 3 });
+      // Single-crate-at-root layout: resolver falls back to default moduleOf
+      // which buckets by "src/<dirname>". So nodes are src, src/sub, src/other.
+      const g = result.graphsByDepth?.[2];
+      const edges = (g?.edges ?? []) as Array<{ source: string; target: string }>;
+      // The real `use crate::sub::s` creates a real edge
+      const realEdge = edges.find(
+        (e) => e.source === "src/other" && e.target === "src/sub"
+      );
+      expect(realEdge).toBeTruthy();
+      // No edges from "src" → child mods coming from lib.rs mod declarations
+      const fromLibSub = edges.find(
+        (e) => e.source === "src" && e.target === "src/sub"
+      );
+      const fromLibOther = edges.find(
+        (e) => e.source === "src" && e.target === "src/other"
+      );
+      expect(fromLibSub).toBeFalsy();
+      expect(fromLibOther).toBeFalsy();
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });
 

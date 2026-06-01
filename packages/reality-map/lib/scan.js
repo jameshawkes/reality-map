@@ -41,10 +41,48 @@ function parseRealityMapIgnoreFile(contents) {
   return patterns;
 }
 
-function globLineToRegex(line) {
+/**
+ * Compile a gitignore-style pattern fragment into a regex source string.
+ *   `**` (alone between slashes) → matches any number of path segments
+ *   `*`                          → matches within a single path segment (no /)
+ *   `?`                          → matches a single non-/ character
+ *   other regex metachars are escaped
+ */
+function globLineToRegexSource(line) {
   let s = "";
   for (let i = 0; i < line.length; i++) {
     const c = line[i];
+    // Handle `**` (with optional surrounding slashes consumed). Patterns:
+    //   "**/foo"  → match foo at any depth
+    //   "foo/**"  → match anything under foo
+    //   "a/**/b"  → match a/.../b at any intermediate depth
+    if (c === "*" && line[i + 1] === "*") {
+      // Look at adjacent slashes for placement-aware behaviour.
+      const prevIsSlash = i === 0 || line[i - 1] === "/";
+      const nextIsSlash = line[i + 2] === "/";
+      if (prevIsSlash && nextIsSlash) {
+        // `/**/` → consume the trailing slash too; matches zero+ segments incl. nothing
+        s += "(?:.*/)?";
+        i += 2; // skip the second * and the following /
+        continue;
+      }
+      if (prevIsSlash && i + 2 === line.length) {
+        // trailing `/**` → match anything (incl. empty) under
+        s += ".*";
+        i += 1;
+        continue;
+      }
+      if (nextIsSlash && i === 0) {
+        // leading `**/` → match any depth prefix incl. empty
+        s += "(?:.*/)?";
+        i += 2;
+        continue;
+      }
+      // Fallback: treat `**` like `.*` (multi-segment)
+      s += ".*";
+      i += 1;
+      continue;
+    }
     if (c === "*") {
       s += "[^/]*";
       continue;
@@ -59,25 +97,58 @@ function globLineToRegex(line) {
     }
     s += c;
   }
-  return new RegExp("^" + s + "$");
+  return s;
 }
 
 /**
- * Minimal ignore rules (not full .gitignore):
+ * Ignore rules (gitignore-style subset):
  * - Lines are paths relative to project root (forward slashes).
- * - `*` and `?` wildcards match within a single path segment (no `/` in a match span).
+ * - `*` and `?` wildcards match within a single path segment.
+ * - `**` matches any number of path segments (e.g. `**​/examples/` matches
+ *   `examples/`, `foo/examples/`, `a/b/examples/`).
  * - If the line has no glob chars, it matches that path or anything under it
  *   (`foo` matches `foo` and `foo/…`; `foo/` is treated the same).
+ * - Trailing `/` on a glob pattern means "match this directory and everything
+ *   under it" — equivalent to appending `**` to the pattern.
+ * - Lines starting with `!` are negations: they re-include paths that
+ *   earlier patterns matched. Order matters; later patterns can re-exclude.
+ *   Like gitignore, a negation cannot re-include a file inside a directory
+ *   that has been excluded — the directory walk skips ignored dirs entirely.
+ *   To re-include inside an excluded dir, use a directory-permissive
+ *   exclude (e.g. exclude only `dir/excluded-file`, not the whole `dir/`).
  */
 function compileRealityMapIgnorePatterns(lines) {
   const out = [];
-  for (const posix of lines) {
+  for (const rawLine of lines) {
+    let posix = rawLine;
+    let negate = false;
+    if (posix.startsWith("!")) {
+      negate = true;
+      posix = posix.slice(1);
+    }
     const hasGlob = /[*?]/.test(posix);
-    if (hasGlob) {
-      out.push({ kind: "glob", re: globLineToRegex(posix), raw: posix });
-    } else {
+    if (!hasGlob) {
       const trimmed = posix.endsWith("/") ? posix.slice(0, -1) : posix;
-      out.push({ kind: "prefix", prefix: trimmed, raw: posix });
+      out.push({ kind: "prefix", prefix: trimmed, raw: rawLine, negate });
+      continue;
+    }
+    // Trailing slash on a glob means "this dir and everything under it".
+    // We expand to two regexes: one that matches the dir itself, one for
+    // its contents.
+    const stripped = posix.endsWith("/") ? posix.slice(0, -1) : posix;
+    const dirOnly = posix.endsWith("/");
+    const baseSrc = globLineToRegexSource(stripped);
+    if (dirOnly) {
+      out.push({ kind: "glob", re: new RegExp("^" + baseSrc + "$"), raw: rawLine, negate });
+      out.push({ kind: "glob", re: new RegExp("^" + baseSrc + "/.*$"), raw: rawLine, negate });
+    } else {
+      out.push({ kind: "glob", re: new RegExp("^" + baseSrc + "$"), raw: rawLine, negate });
+      // For glob patterns without trailing slash that don't already end in
+      // a wildcard, also match descendants (gitignore intuition: `foo*` and
+      // `foo/bar` both implicitly cover children).
+      if (!/[*?]$/.test(stripped)) {
+        out.push({ kind: "glob", re: new RegExp("^" + baseSrc + "/.*$"), raw: rawLine, negate });
+      }
     }
   }
   return out;
@@ -104,14 +175,20 @@ function relPosixFromRoot(root, fullPath) {
 
 function isIgnoredRel(rel, isDir, matchers) {
   if (!matchers || !matchers.length) return false;
+  // Walk all patterns in order; the LAST matching pattern wins. This mirrors
+  // gitignore semantics: `!pattern` re-includes paths matched by earlier
+  // ignore patterns, and a later ignore can re-exclude them.
+  let ignored = false;
   for (const m of matchers) {
+    let matches = false;
     if (m.kind === "glob") {
-      if (m.re.test(rel)) return true;
+      matches = m.re.test(rel);
     } else if (m.kind === "prefix") {
-      if (rel === m.prefix || rel.startsWith(m.prefix + "/")) return true;
+      matches = rel === m.prefix || rel.startsWith(m.prefix + "/");
     }
+    if (matches) ignored = !m.negate;
   }
-  return false;
+  return ignored;
 }
 
 function collectExternalDepFiles(srcRoot, cap = 5000) {
@@ -140,13 +217,24 @@ function collectExternalDepFiles(srcRoot, cap = 5000) {
 async function walk(root, opts = {}) {
   const codeExtSet = opts.codeExtSet instanceof Set ? opts.codeExtSet : CODE_EXT;
   const ignoreMatchers = opts.ignoreMatchers || [];
+  const hasNegations = ignoreMatchers.some((m) => m.negate);
   function isCodeFile(file) {
     return codeExtSet.has(path.extname(file).toLowerCase());
   }
   const out = [];
   async function rec(dir) {
     const relHere = relPosixFromRoot(root, dir);
-    if (relHere && relHere !== "." && isIgnoredRel(relHere, true, ignoreMatchers)) return;
+    // Without negations, ignored directories are pruned for speed.
+    // With negations, descend anyway and let per-file filtering decide —
+    // a re-include pattern may target files inside an otherwise-ignored dir.
+    if (
+      !hasNegations &&
+      relHere &&
+      relHere !== "." &&
+      isIgnoredRel(relHere, true, ignoreMatchers)
+    ) {
+      return;
+    }
     let entries;
     try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); }
     catch { return; }
@@ -155,8 +243,16 @@ async function walk(root, opts = {}) {
       if (IGNORE_DIRS.has(e.name)) continue;
       const full = path.join(dir, e.name);
       const rel = relPosixFromRoot(root, full);
-      if (isIgnoredRel(rel, e.isDirectory(), ignoreMatchers)) continue;
-      if (e.isDirectory()) await rec(full);
+      const isDir = e.isDirectory();
+      const ignored = isIgnoredRel(rel, isDir, ignoreMatchers);
+      if (ignored) {
+        // Without negations, prune entirely.
+        if (!hasNegations) continue;
+        // With negations: recurse into dirs anyway (a deeper re-include may
+        // bring back individual files). Skip ignored regular files.
+        if (!isDir) continue;
+      }
+      if (isDir) await rec(full);
       else if (e.isFile() && isCodeFile(e.name)) out.push(full);
     }
   }
@@ -922,7 +1018,15 @@ async function scanProject(root, opts = {}) {
       for (const c of (importData.classified || [])) {
         const resolved = resolveRustImport(f, c, ctx);
         if (resolved && resolved !== f) {
-          fileEdges.push([f, resolved]);
+          // Tag `mod foo;` declaration edges so the module-graph projection
+          // can skip them — declaring a submodule is not a real architectural
+          // dependency (it's hierarchy plumbing). File-level analysis still
+          // sees the edge so child files don't appear orphaned.
+          if (c.kind === "mod") {
+            fileEdges.push([f, resolved, "mod"]);
+          } else {
+            fileEdges.push([f, resolved]);
+          }
         }
       }
 
@@ -1012,19 +1116,86 @@ async function scanProject(root, opts = {}) {
     const memberDir = path.dirname(pkg.manifest);
     // Member path relative to scan root, POSIX-separated
     const memberRel = path.relative(root, memberDir).split(path.sep).join("/");
-    if (!memberRel) return null; // single-crate-at-root: member IS the scan root
+    if (!memberRel) {
+      // single-crate-at-root: member IS the scan root. Targets like
+      // examples/foo.rs still deserve to be their own modules, so handle
+      // them with an empty member prefix below.
+    }
 
     // File path relative to scan root, POSIX-separated
     const fileRel = path.relative(root, absFile).split(path.sep).join("/");
 
-    // Strip member prefix + leading slash
-    let remainder = fileRel.slice(memberRel.length).replace(/^\//, "");
+    // Strip member prefix + leading slash. When memberRel is empty (crate at
+    // scan root), this is a no-op.
+    let remainder = memberRel
+      ? fileRel.slice(memberRel.length).replace(/^\//, "")
+      : fileRel;
 
-    // Elide leading "src/" inside the member, always
+    // Cargo auto-discovered target directories where each file/subdir is its
+    // own architecturally-meaningful compilation unit:
+    //   examples/foo.rs           → memberRel/examples/foo
+    //   examples/foo/main.rs      → memberRel/examples/foo
+    //   examples/foo/anything.rs  → memberRel/examples/foo (helpers grouped)
+    //   src/bin/foo.rs            → memberRel/bin/foo
+    //   src/bin/foo/main.rs       → memberRel/bin/foo
+    //
+    // benches/ and tests/ deliberately NOT separated here — they're crate-
+    // level concerns (one Cargo target per file too, but architecturally
+    // closer to "support code" than to the lib graph). They fall through to
+    // the default member-directory grouping, so benches lump into one node.
+    const TARGET_DIRS = ["examples"];
+    for (const td of TARGET_DIRS) {
+      if (remainder === td || remainder.startsWith(td + "/")) {
+        const rest = remainder.slice(td.length).replace(/^\//, "");
+        if (!rest) {
+          // The target dir itself with no children — shouldn't happen in practice.
+          return memberRel ? `${memberRel}/${td}` : td;
+        }
+        // First path segment names the target. If `rest` is a flat file like
+        // `foo.rs`, strip the extension. Otherwise it's a subdir like
+        // `foo/main.rs` → use the first segment.
+        const firstSeg = rest.split("/")[0].replace(/\.rs$/, "");
+        const id = memberRel ? `${memberRel}/${td}/${firstSeg}` : `${td}/${firstSeg}`;
+        return id;
+      }
+    }
+    // src/bin/<name>... — same handling, but the `src/` prefix is elided as usual.
+    if (remainder.startsWith("src/bin/")) {
+      const rest = remainder.slice("src/bin/".length);
+      const firstSeg = rest.split("/")[0].replace(/\.rs$/, "");
+      const id = memberRel ? `${memberRel}/bin/${firstSeg}` : `bin/${firstSeg}`;
+      return id;
+    }
+
+    // Single-crate-at-root with no target-dir match: fall back to default
+    // moduleOf grouping (return null to signal that).
+    if (!memberRel) return null;
+
+    // Elide leading "src/" inside the member, always (regular lib/main flow)
     if (remainder.startsWith("src/")) remainder = remainder.slice(4);
 
+    // Flat `.rs` file directly inside src/ (no intermediate directories):
+    // at depth 2+, promote it to its own module node, e.g.
+    // `quiver/src/scenes.rs` → `quiver/scenes`. This matches Rust's module
+    // system, where `scenes.rs` IS the `quiver::scenes` module — equivalent
+    // in semantics to `scenes/mod.rs`. At depth 1 the whole crate collapses
+    // to a single node (consistent with how dir-based modules behave at
+    // depth 1), so flat files stay bucketed as the crate root. Exception:
+    // `lib.rs` / `main.rs` are the crate root entry points and always
+    // remain bucketed as the crate root itself.
+    const segments = remainder.split("/").filter(Boolean);
+    if (segments.length === 1) {
+      const fname = segments[0];
+      const stem = fname.replace(/\.rs$/, "");
+      if (stem === "lib" || stem === "main") {
+        return memberRel;
+      }
+      if (depth <= 1) return memberRel;
+      return `${memberRel}/${stem}`;
+    }
+
     // Drop the filename, leaving only intermediate-dir segments
-    const dirParts = remainder.split("/").slice(0, -1);
+    const dirParts = segments.slice(0, -1);
 
     // Take up to (depth - 1) intermediate dirs
     const takeN = Math.max(0, depth - 1);
@@ -1048,7 +1219,13 @@ async function scanProject(root, opts = {}) {
 
     const edgeWeights = new Map();
     const moduleEdgesFiles = new Map();
-    for (const [a, b] of fileEdges) {
+    for (const edge of fileEdges) {
+      const [a, b, kind] = edge;
+      // Skip `mod foo;` declaration edges in the module graph. They aren't
+      // architectural dependencies — they're how Rust expresses hierarchy.
+      // (File-level analysis below still uses these edges so child modules
+      // don't appear orphaned in fan-in / isolated-file counts.)
+      if (kind === "mod") continue;
       const ma = fileToMod.get(a), mb = fileToMod.get(b);
       if (!ma || !mb || ma === mb) continue;
       const k = ma + "|" + mb;

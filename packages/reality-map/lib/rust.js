@@ -549,10 +549,86 @@ function extractRustImports(src) {
     return " ".repeat(match.length);
   });
 
+  // Step 1.5: Identify `#[cfg(test)]`-gated regions.
+  //
+  // We treat the contents of any item directly annotated with a test-only
+  // cfg attribute as "test-gated". Phase 1 only uses this to drop
+  // `use super::*` / `use super::Foo` statements that are testing the
+  // module itself (a Rust idiom that creates phantom architectural edges).
+  // Cross-module imports inside test blocks are KEPT (they're real
+  // architectural information — see Phase 2 plan).
+  //
+  // We detect three patterns:
+  //   1. `#[cfg(test)]\nmod tests { ... }`          — most common
+  //   2. `#[cfg(any(test, ...))]\nmod foo { ... }`  — multi-condition
+  //   3. `#[cfg(test)]\nfn it_works() { ... }`      — bare test fn (less
+  //      common because tests usually live inside `mod tests`)
+  //
+  // Implementation: scan `stripped` for `#[cfg(...)]` attributes that contain
+  // the bare identifier `test` (with word boundaries), then find the next
+  // item body opening `{` and balance braces to find the end.
+  const testGatedRanges = [];
+  // Find each `#[cfg(` attribute and balance its parens manually so we handle
+  // nested patterns like `#[cfg(any(test, feature = "x"))]`.
+  const cfgStartRe = /#\[\s*cfg\s*\(/g;
+  let cfgStart;
+  while ((cfgStart = cfgStartRe.exec(stripped)) !== null) {
+    // Balance parens starting after the opening `(`.
+    let parenDepth = 1;
+    let p = cfgStart.index + cfgStart[0].length;
+    while (p < stripped.length && parenDepth > 0) {
+      const c = stripped[p];
+      if (c === "(") parenDepth++;
+      else if (c === ")") parenDepth--;
+      if (parenDepth === 0) break;
+      p++;
+    }
+    if (parenDepth !== 0) continue;
+    const cfgArgs = stripped.slice(cfgStart.index + cfgStart[0].length, p);
+    // Skip past the closing `)` and the `]`.
+    let attrEnd = p + 1;
+    while (attrEnd < stripped.length && /\s/.test(stripped[attrEnd])) attrEnd++;
+    if (stripped[attrEnd] !== "]") continue;
+    attrEnd++;
+    // Conservatively match the bare token `test` (not `test_foo`, `nottest`, etc.).
+    if (!/\btest\b/.test(cfgArgs)) continue;
+    // Skip past the attribute to find the next `{`. Tolerate whitespace,
+    // additional attributes, `pub` etc. Bail if we see a `;` first
+    // (would indicate the attribute is on a statement, not an item body).
+    let i = attrEnd;
+    let foundBrace = -1;
+    while (i < stripped.length) {
+      const c = stripped[i];
+      if (c === "{") { foundBrace = i; break; }
+      if (c === ";") break;
+      i++;
+    }
+    if (foundBrace === -1) continue;
+    // Balance braces.
+    let depth = 1;
+    let j = foundBrace + 1;
+    while (j < stripped.length && depth > 0) {
+      const c = stripped[j];
+      if (c === "{") depth++;
+      else if (c === "}") depth--;
+      j++;
+    }
+    if (depth !== 0) continue; // unbalanced; bail safely
+    // Range is [foundBrace+1, j-1) — characters strictly inside the body.
+    testGatedRanges.push([foundBrace + 1, j - 1]);
+  }
+
+  function isInTestGatedRegion(idx) {
+    for (const [start, end] of testGatedRanges) {
+      if (idx >= start && idx < end) return true;
+    }
+    return false;
+  }
+
   // Step 2: Find all `use ...;` statements (multi-line tolerant)
   // Scan for `use ` (possibly preceded by `pub `)
   // Collect chars until `;` at brace depth 0
-  const useStatements = []; // { raw, index }
+  const useStatements = []; // { raw, index, testGated }
 
   const useStartRe = /(?:^|\n)([ \t]*(?:pub\s+)?use\s+)/g;
   let useMatch;
@@ -577,7 +653,8 @@ function extractRustImports(src) {
       const raw = stripped.slice(pathStart, i).trim();
       const lineNum = src.substring(0, stmtStart).split("\n").length;
       const statement = src.substring(stmtStart, i + 1).trim();
-      useStatements.push({ raw, index: stmtStart, line: lineNum, statement });
+      const testGated = isInTestGatedRegion(stmtStart);
+      useStatements.push({ raw, index: stmtStart, line: lineNum, statement, testGated });
     }
   }
 
@@ -739,11 +816,20 @@ function extractRustImports(src) {
   const specsSet = new Set();
 
   // Process use statements
-  for (const { raw, line, statement } of useStatements) {
+  for (const { raw, line, statement, testGated } of useStatements) {
     const expanded = expandPath(raw);
     for (const fullPath of expanded) {
       const entry = classifyPath(fullPath, line, statement);
       if (!entry) continue; // dropped (std/core/alloc)
+
+      // Phase 1 test-gating: drop `super::*` / `self::*` imports inside
+      // #[cfg(test)] blocks. These are the "testing my own module" idiom and
+      // generate phantom architectural edges. Cross-module test imports
+      // (`crate::other::Foo`, external crates) are kept — they represent
+      // real test-coupling that's worth surfacing in Phase 2.
+      if (testGated && (entry.kind === "super" || entry.kind === "self")) {
+        continue;
+      }
 
       classified.push(entry);
 
