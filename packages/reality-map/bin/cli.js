@@ -986,6 +986,7 @@ function buildDependencyTree(scan, modId, maxDepth) {
     root: args.root,
     maxDepth: args.depth,
     watch: args.watch,
+    followDeps: args.followDeps,
   });
 
   if (triedFallback && !args.quiet) {

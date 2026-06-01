@@ -42,7 +42,7 @@ function readBody(req, limit = 65536) {
   });
 }
 
-function startServer({ port, graph, root, maxDepth, watch = false }) {
+function startServer({ port, graph, root, maxDepth, watch = false, followDeps = false }) {
   let currentGraph = graph;
   let currentMaxDepth = Math.max(1, Math.min(5, Number(maxDepth ?? graph.maxDepth ?? 3)));
 
@@ -53,7 +53,7 @@ function startServer({ port, graph, root, maxDepth, watch = false }) {
         currentMaxDepth = Math.max(1, Math.min(5, j.maxDepth));
       }
     } catch { }
-    currentGraph = await scanProject(root, { maxDepth: currentMaxDepth });
+    currentGraph = await scanProject(root, { maxDepth: currentMaxDepth, followDeps });
     return currentGraph;
   }
 
