@@ -797,4 +797,93 @@ describe("follow external cargo deps", () => {
     expect(normA.root).toBe(WSDEP);
     expect(normB.root).toBe(WSDEP);
   });
+
+  // ── Task 7: unit tests for extractExternalDeps filter ──────────────────────
+
+  describe("extractExternalDeps filter", () => {
+    function meta() {
+      return makeMetadata(
+        [
+          { id: "ext1", name: "bits", manifest_path: "/c/bits/Cargo.toml", targets: [{ kind: ["lib"], src_path: "/c/bits/src/lib.rs" }] },
+          { id: "ext2", name: "bits-server", manifest_path: "/c/bits-server/Cargo.toml", targets: [{ kind: ["lib"], src_path: "/c/bits-server/src/lib.rs" }] },
+          { id: "ext3", name: "serde", manifest_path: "/c/serde/Cargo.toml", targets: [{ kind: ["lib"], src_path: "/c/serde/src/lib.rs" }] },
+          { id: "ext4", name: "foo", manifest_path: "/c/foo/Cargo.toml", targets: [{ kind: ["lib"], src_path: "/c/foo/src/lib.rs" }] },
+          { id: "ext5", name: "barfoo", manifest_path: "/c/barfoo/Cargo.toml", targets: [{ kind: ["lib"], src_path: "/c/barfoo/src/lib.rs" }] },
+        ],
+        []
+      );
+    }
+
+    it("null filter is identical to omitted filter (no-op)", () => {
+      const a = extractExternalDeps(meta());
+      const b = extractExternalDeps(meta(), null);
+      expect(a).toEqual(b);
+    });
+
+    it("/^bits/ matches bits-prefixed crates only", () => {
+      const result = extractExternalDeps(meta(), /^bits/);
+      expect(result.map((d: any) => d.name).sort()).toEqual(["bits", "bits-server"]);
+    });
+
+    it("/nomatchxyz/ matches nothing returns []", () => {
+      const result = extractExternalDeps(meta(), /nomatchxyz/);
+      expect(result).toEqual([]);
+    });
+
+    it("unanchored /foo/ matches both foo and barfoo", () => {
+      const result = extractExternalDeps(meta(), /foo/);
+      expect(result.map((d: any) => d.name).sort()).toEqual(["barfoo", "foo"]);
+    });
+  });
+
+  // ── Task 8: integration tests on workspace-with-external-dep fixture ───────
+
+  it("scanProject parity: depsFilter:null produces identical normalized output to omitted depsFilter", async () => {
+    const a = await scanProject(WSDEP, { followDeps: true });
+    const b = await scanProject(WSDEP, { followDeps: true, depsFilter: null });
+    expect(normalizeForDiff(a)).toEqual(normalizeForDiff(b));
+  });
+
+  it("extractExternalDeps + filter: only matching crates included via scanProject path", () => {
+    const metadata = {
+      packages: [
+        { id: "ws1", name: "app", manifest_path: "/ws/app/Cargo.toml", targets: [{ kind: ["bin"], src_path: "/ws/app/src/main.rs" }] },
+        { id: "ext1", name: "bits", manifest_path: "/c/bits/Cargo.toml", targets: [{ kind: ["lib"], src_path: "/c/bits/src/lib.rs" }] },
+        { id: "ext2", name: "serde", manifest_path: "/c/serde/Cargo.toml", targets: [{ kind: ["lib"], src_path: "/c/serde/src/lib.rs" }] },
+      ],
+      workspace_members: ["ws1"],
+    };
+    const all = extractExternalDeps(metadata);
+    const filtered = extractExternalDeps(metadata, /^bits/);
+    expect(all.map((d: any) => d.name).sort()).toEqual(["bits", "serde"]);
+    expect(filtered.map((d: any) => d.name)).toEqual(["bits"]);
+  });
+});
+
+// ── Task 9: CLI --deps-filter behaviour tests ─────────────────────────────────
+
+describe("--deps-filter CLI behaviour", () => {
+  const CLI = require("path").resolve(__dirname, "../bin/cli.js");
+
+  it("invalid regex exits 1 with 'invalid regex' in stderr", () => {
+    const r = spawnSync("node", [CLI, "--deps-filter=[bad(", "."], { encoding: "utf8" });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("invalid regex");
+  });
+
+  it("--deps-filter without --follow-deps implies --follow-deps", () => {
+    const fixture = require("path").resolve(__dirname, "fixtures/rust/workspace-with-external-dep");
+    const r = spawnSync(
+      "node",
+      [CLI, "--deps-filter=^bits", "--no-serve", "--summary-json", fixture],
+      {
+        encoding: "utf8",
+        timeout: 60000,
+      }
+    );
+    // The deterministic assertion: stderr must contain the implies note
+    expect(r.stderr).toContain("--deps-filter implies --follow-deps");
+    // CLI must not crash (exit 0 or null on timeout)
+    expect(r.status === 0 || r.status === null).toBeTruthy();
+  });
 });

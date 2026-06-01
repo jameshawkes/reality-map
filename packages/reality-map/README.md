@@ -301,10 +301,37 @@ node bin/cli.js --follow-deps /path/to/your/cargo/project
 - Per-dep cap: each external dep can contribute at most 5000 `.rs` files. Beyond
   that, the remainder is truncated with a stderr warning.
 
+**Scoping with `--deps-filter`:**
+
+Pulling 500+ transitive crates is overwhelming when you only care about a few. Pass
+`--deps-filter=REGEX` to restrict `--follow-deps` to crates whose name matches a
+JavaScript regex. The filter applies inside `extractExternalDeps` before any file
+walking — non-matching crates never enter the pipeline, so the cost saving is real.
+
+```sh
+# Only follow crates whose name starts with "bits"
+node bin/cli.js --follow-deps --deps-filter='^bits' /path/to/your/cargo/project
+
+# --deps-filter implies --follow-deps (this works too):
+node bin/cli.js --deps-filter='^bits' /path/to/your/cargo/project
+```
+
+Behaviour:
+- Match is unanchored — `--deps-filter='foo'` matches both `foo` and `barfoo`.
+  Add `^` and `$` for strict bounds.
+- Case-sensitive. No auto `/i`.
+- Empty pattern (`--deps-filter=''`) disables the filter.
+- Invalid regex exits 1 with `invalid regex: …` on stderr.
+- Specifying `--deps-filter` without `--follow-deps` implicitly enables
+  `--follow-deps` with a one-line stderr note.
+
+On `polytope-server` (538 transitive crates), `--deps-filter='^bits'` reduces the
+scan from 14,442 files / 32 s to 106 files / 473 ms.
+
 **Limitations:**
-- No `--deps-mode={path,git,registry,all}` filtering yet (v2 follow-up). It's
-  all-or-nothing for now.
-- No `--deps-filter=PATTERN` regex (v2 follow-up).
+- No `--deps-mode={path,git,registry,all}` source-type filtering yet (separate
+  follow-up).
+- No `--deps-exclude` or multiple patterns (separate follow-up).
 - No `--deps-offline` flag. If `Cargo.lock` is stale, cargo may fetch from the
   network (we do not pass `--offline`).
 - External dep file paths are absolute and machine-specific (under

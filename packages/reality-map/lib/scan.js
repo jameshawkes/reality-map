@@ -846,7 +846,7 @@ async function scanProject(root, opts = {}) {
       onProgress({ phase: "cargo_metadata" });
       const result = runCargoMetadata(rootCargo);
       if (result.ok) {
-        externalDeps = extractExternalDeps(result.metadata);
+        externalDeps = extractExternalDeps(result.metadata, opts.depsFilter || null);
         for (const dep of externalDeps) {
           const depFiles = collectExternalDepFiles(dep.srcRoot);
           for (const f of depFiles) externalFiles.push({ file: f, depName: dep.name });

@@ -69,6 +69,7 @@ function parseArgs(argv) {
     unreachableFiles: null, // {entry, srcDir}
     unreachableFilesJson: false,
     followDeps: false,
+    depsFilter: null,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -217,6 +218,21 @@ function parseArgs(argv) {
       args.deps = true;
     } else if (a === "--follow-deps") {
       args.followDeps = true;
+    } else if (a === "--deps-filter" || a.startsWith("--deps-filter=")) {
+      const pattern = a.startsWith("--deps-filter=") ? a.slice("--deps-filter=".length) : argv[++i];
+      if (pattern) {
+        try {
+          args.depsFilter = new RegExp(pattern);
+        } catch (e) {
+          process.stderr.write(`reality-map: --deps-filter: invalid regex: ${e.message}\n`);
+          process.exit(1);
+        }
+        if (!args.followDeps) {
+          args.followDeps = true;
+          process.stderr.write(`reality-map: --deps-filter implies --follow-deps\n`);
+        }
+      }
+      // Empty pattern → null (already the default), no implicit follow-deps
     } else if (a === "--deps-json") {
       args.depsJson = true;
       args.deps = true;
@@ -319,6 +335,10 @@ Options:
                      Exit 1 if vulnerabilities at or above severity are found (default: critical)
                      Severity levels: low, moderate, high, critical
       --follow-deps          Follow Cargo dependencies (git, path, registry) into the scan
+      --deps-filter <regex>  Restrict --follow-deps to crates whose name matches the regex.
+                             Implies --follow-deps. Unanchored. Case-sensitive.
+                             Example: --deps-filter='^bits'
+                             Empty value disables the filter.
   -h, --help         Show help
   -V, --version      Print version
 
@@ -574,6 +594,7 @@ function buildDependencyTree(scan, modId, maxDepth) {
     maxDepth: args.depth,
     includeExt: args.includeExt.length ? args.includeExt : undefined,
     followDeps: args.followDeps,
+    depsFilter: args.depsFilter,
     onProgress:
       args.quiet || args.jsonOut || args.summaryJson || args.listFiles
         ? undefined
@@ -731,7 +752,8 @@ function buildDependencyTree(scan, modId, maxDepth) {
       `  ${dim("summary")}  ${bold(scan.stats.files)} files · ${bold(depth1.stats.modules)} modules · ${bold(depth1.stats.edges)} edges · ${depth1.stats.cycles} cycle(s) · ${extRefs} ext. refs · depth ${args.depth} ${dim(`(${scanMs}ms)`)}`
     );
     if (scan.followDeps) {
-      log(`  ${dim("follow-deps")}  ${scan.followDeps.depCount} external crates, ${scan.followDeps.fileCount} .rs files added`);
+      const filterNote = args.depsFilter ? ` (filter: ${args.depsFilter.source})` : "";
+      log(`  ${dim("follow-deps")}  ${scan.followDeps.depCount} external crates, ${scan.followDeps.fileCount} .rs files added${filterNote}`);
     }
   }
 
@@ -987,6 +1009,7 @@ function buildDependencyTree(scan, modId, maxDepth) {
     maxDepth: args.depth,
     watch: args.watch,
     followDeps: args.followDeps,
+    depsFilter: args.depsFilter,
   });
 
   if (triedFallback && !args.quiet) {

@@ -264,7 +264,9 @@ function runCargoMetadata(manifestPath) {
   return { ok: true, metadata: JSON.parse(spawnResult.stdout.toString()) };
 }
 
-function extractExternalDeps(metadata) {
+// depsFilter contract: pass a RegExp instance or null. Strings will blow up
+// at filter.test(). CLI compiles strings; downstream callers must compile.
+function extractExternalDeps(metadata, filter = null) {
   if (!metadata || !metadata.packages || metadata.packages.length === 0) {
     return [];
   }
@@ -284,6 +286,8 @@ function extractExternalDeps(metadata) {
     }
     // Skip proc-macro-only, cdylib-only, or packages with no lib/bin target
     if (!chosenTarget) continue;
+
+    if (filter && !filter.test(pkg.name)) continue;
 
     const srcRoot = path.dirname(chosenTarget.src_path);
     result.push({
