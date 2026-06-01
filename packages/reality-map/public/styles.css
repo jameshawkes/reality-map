@@ -153,19 +153,17 @@ body {
   border-radius: 0 0 3px 3px;
 }
 .node-fo-inner {
-  padding: 10px 12px 8px 12px;
-  display: flex; flex-direction: column; gap: 3px;
+  padding: 14px 16px 12px 16px;
+  display: flex; flex-direction: column; justify-content: center; gap: 6px;
   height: 100%; box-sizing: border-box;
 }
 .node-fo-label {
-  font-size: 12px; font-weight: 500;
+  font-size: 20px; font-weight: 600; line-height: 1.15;
   color: oklch(0.97 0.005 250);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .node-fo-sub {
-  font-size: 9px;
-  font-family: "JetBrains Mono", monospace;
-  text-transform: uppercase; letter-spacing: 0.07em;
+  font-size: 12px; font-weight: 400;
   color: oklch(0.68 0.025 260);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }

@@ -74,6 +74,10 @@
   // "all" | "warn" | "hot" | "clean"
   let edgeFilter = "all";
 
+  // Clean up an old localStorage key from the (removed) per-module depth
+  // override feature, to avoid carrying stale data forward.
+  try { localStorage.removeItem("rm-module-depth-overrides"); } catch {}
+
   // ── Phase 2: clustering ───────────────────────────────────────
   let collapsedClusters = new Set();
   let selectedClusterFilter = null;
@@ -253,7 +257,7 @@
 
   function computeDagrePositions(nodes, edges) {
     if (!nodes.length) return new Map();
-    const NW = 220, NH = 70;
+    const NW = 220, NH = 88;
     const g = new dagre.graphlib.Graph({ multigraph: false, compound: false });
     g.setGraph({ rankdir: "TB", nodesep: 60, ranksep: 90, marginx: 40, marginy: 40 });
     g.setDefaultEdgeLabel(() => ({}));
@@ -291,7 +295,7 @@
 
   async function computeElkPositions(nodes, edges) {
     if (!nodes.length) return new Map();
-    const NW = 220, NH = 70;
+    const NW = 220, NH = 88;
     const elk = await loadElk();
     const graph = {
       id: "root",
@@ -1368,7 +1372,7 @@
     svg.appendChild(rootG);
 
     const NW = 220,
-      NH = 70;
+      NH = 88;
 
     // Find max LOC for scaling
     const maxLoc = Math.max(...graph.nodes.map((n) => n.loc), 1);
@@ -1470,9 +1474,8 @@
       const curW = NW + extraW;
       const curH = NH + extraH;
 
-      const pct = Math.round((n.loc / barMax) * 100);
-      const labelTxt = n.label.length > 26 ? n.label.slice(0, 24) + "…" : n.label;
-      const subTxt = (n.sub ?? "") + " · ⇣" + (n.fanIn ?? 0) + " ⇡" + (n.fanOut ?? 0);
+      const labelTxt = n.label.length > 22 ? n.label.slice(0, 20) + "…" : n.label;
+      const subTxt = n.sub ?? "";
 
       const fo = document.createElementNS("http://www.w3.org/2000/svg", "foreignObject");
       fo.setAttribute("x", 0);
@@ -1495,7 +1498,6 @@
         <div class="node-fo-inner">
           <div class="node-fo-label">${labelTxt}</div>
           <div class="node-fo-sub">${subTxt}</div>
-          <div class="node-fo-bar-bg"><div class="node-fo-bar" style="width:${pct}%;background:${accentColor}"></div></div>
         </div>
         ${n.warn ? `<div class="node-fo-badge node-fo-badge-hover" data-warn="${warnTooltipMsg.replace(/"/g, "&#34;")}" data-tip="${warnTip.replace(/"/g, "&#34;")}">!</div>` : ""}
         ${view.depth === maxDepth ? `<div style="position:absolute;bottom:7px;right:9px;font-size:9px;opacity:0.45;color:${accentColor};pointer-events:none">⊕</div>` : ""}
@@ -1889,11 +1891,14 @@
 
   async function loadGraph(fromButton) {
     if (fromButton) stats.textContent = "rescanning…";
+    // Note: rescan body is intentionally empty. Server-side maxDepth is fixed
+    // at startup; rescans re-read the filesystem at that depth. The depth
+    // dropdown only changes which precomputed graph the client renders.
     const r = fromButton
       ? await fetch("/api/rescan", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ maxDepth: Number(depthSelect.value) || maxDepth }),
+          body: "{}",
         }).then((x) => x.json())
       : await fetch("/api/graph").then((x) => x.json());
     if (r.error) {

@@ -46,13 +46,11 @@ function startServer({ port, graph, root, maxDepth, watch = false, followDeps = 
   let currentGraph = graph;
   let currentMaxDepth = Math.max(1, Math.min(5, Number(maxDepth ?? graph.maxDepth ?? 3)));
 
-  async function runRescan(body) {
-    try {
-      const j = JSON.parse(body || "{}");
-      if (Number.isFinite(j.maxDepth)) {
-        currentMaxDepth = Math.max(1, Math.min(5, j.maxDepth));
-      }
-    } catch { }
+  async function runRescan(_body) {
+    // Note: maxDepth is fixed at server startup time (from the CLI). Rescans
+    // re-read the filesystem at the same depth. View depth is purely a
+    // client-side concern; changing it never needs a rescan because all
+    // depths 1..currentMaxDepth are precomputed and returned in graphsByDepth.
     currentGraph = await scanProject(root, { maxDepth: currentMaxDepth, followDeps, depsFilter });
     return currentGraph;
   }

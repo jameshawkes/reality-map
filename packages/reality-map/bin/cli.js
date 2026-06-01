@@ -29,7 +29,7 @@ function parseArgs(argv) {
     port: 4317,
     open: true,
     quiet: false,
-    depth: 3,
+    depth: 5,
     portAttempts: 12,
     watch: false,
     jsonOut: false,
@@ -272,7 +272,8 @@ Usage:
 Options:
   -p, --port <n>     Port to serve dashboard on (default 4317)
       --no-open      Do not auto-open the browser
-  -d, --depth <n>    Module grouping depth 1–5 (default 3)
+  -d, --depth <n>    Module grouping depth 1–5 (default 5). All depths 1..n
+                     are precomputed; the dashboard depth selector picks one.
   -q, --quiet        Minimal output (URL + errors only; with --json, stderr only)
   -w, --watch        Rescan when source files change (dashboard auto-refreshes)
       --json, --stdout
