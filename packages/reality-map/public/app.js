@@ -171,18 +171,9 @@
     };
   }
 
-  function edgeKey(e) {
-    return `${e.source}\u0000${e.target}`;
-  }
-
   function getLayoutPositions(entry) {
     if (!entry) return null;
     return entry instanceof Map ? entry : entry.positions;
-  }
-
-  function edgeRouteToPath(points) {
-    if (!points || points.length < 2) return null;
-    return points.map((p, i) => `${i === 0 ? "M" : "L"}${p.x},${p.y}`).join(" ");
   }
 
   let currentLayout = localStorage.getItem("rm-layout") || "server";
@@ -318,14 +309,14 @@
     });
 
     const ITER = 320;
-    const BASE_LINK = 255;
-    const REPULSE = 18000;
-    const EDGE_K = 0.025;
-    const OVERLAP_K = 0.22;
+    const BASE_LINK = 330;
+    const REPULSE = 28000;
+    const EDGE_K = 0.022;
+    const OVERLAP_K = 0.26;
     const DOWN_K = 0.018;
     const DAMP = 0.76;
-    const NODE_GAP_X = 54;
-    const NODE_GAP_Y = 44;
+    const NODE_GAP_X = 105;
+    const NODE_GAP_Y = 82;
 
     for (let iter = 0; iter < ITER; iter++) {
       const cooling = 1 - iter / ITER;
@@ -375,7 +366,7 @@
         const dist = Math.sqrt(dx * dx + dy * dy) || 1;
         dx /= dist; dy /= dist;
         const weight = Math.max(1, e.weight || 1);
-        const desired = Math.max(160, BASE_LINK - Math.min(70, Math.log2(weight + 1) * 22));
+        const desired = Math.max(215, BASE_LINK - Math.min(70, Math.log2(weight + 1) * 22));
         const force = (dist - desired) * EDGE_K;
         a.vx += dx * force;
         a.vy += dy * force;
@@ -493,39 +484,19 @@
   }
 
   async function computeElkPositions(nodes, edges) {
-    if (!nodes.length) return { positions: new Map(), edgeRoutes: new Map() };
-    const maxLoc = graphMaxLoc(nodes);
-    const nodeSizes = new Map(nodes.map((n) => [n.id, nodeVisualSize(n, maxLoc)]));
+    if (!nodes.length) return new Map();
+    const NW = NODE_BASE_W, NH = NODE_BASE_H;
     const elk = await loadElk();
-    const edgeKeyByElkId = new Map();
-    const elkEdges = edges.map((e, i) => {
-      const id = `e${i}`;
-      edgeKeyByElkId.set(id, edgeKey(e));
-      return { id, sources: [e.source], targets: [e.target] };
-    });
     const graph = {
       id: "root",
       layoutOptions: {
         "elk.algorithm": "layered",
         "elk.direction": "DOWN",
-        "elk.edgeRouting": "ORTHOGONAL",
-        "elk.padding": "[top=70,left=70,bottom=70,right=70]",
-        "elk.spacing.nodeNode": "85",
-        "elk.spacing.edgeNode": "55",
-        "elk.spacing.edgeEdge": "20",
-        "elk.spacing.componentComponent": "120",
-        "elk.layered.spacing.nodeNodeBetweenLayers": "130",
-        "elk.layered.spacing.edgeNodeBetweenLayers": "65",
-        "elk.layered.spacing.edgeEdgeBetweenLayers": "20",
-        "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF",
-        "elk.layered.crossingMinimization.strategy": "LAYER_SWEEP",
-        "elk.layered.cycleBreaking.strategy": "GREEDY",
+        "elk.layered.spacing.nodeNodeBetweenLayers": "80",
+        "elk.spacing.nodeNode": "40",
       },
-      children: nodes.map((n) => {
-        const size = nodeSizes.get(n.id);
-        return { id: n.id, width: size.width, height: size.height };
-      }),
-      edges: elkEdges,
+      children: nodes.map((n) => ({ id: n.id, width: NW, height: NH })),
+      edges: edges.map((e, i) => ({ id: `e${i}`, sources: [e.source], targets: [e.target] })),
     };
     console.time("rm-elk");
     const laid = await elk.layout(graph);
@@ -535,20 +506,7 @@
       // ELK returns top-left coords; n.x/n.y are also top-left → no conversion needed
       positions.set(c.id, { x: Math.round(c.x), y: Math.round(c.y) });
     }
-    const edgeRoutes = new Map();
-    for (const edge of laid.edges || []) {
-      const section = edge.sections && edge.sections[0];
-      if (!section || !section.startPoint || !section.endPoint) continue;
-      const points = [
-        section.startPoint,
-        ...(section.bendPoints || []),
-        section.endPoint,
-      ].map((p) => ({ x: Math.round(p.x), y: Math.round(p.y) }));
-      const key = edgeKeyByElkId.get(edge.id)
-        || (edge.sources && edge.targets ? `${edge.sources[0]}\u0000${edge.targets[0]}` : edge.id);
-      edgeRoutes.set(key, points);
-    }
-    return { positions, edgeRoutes };
+    return positions;
   }
 
   function switchLayout(layout) {
@@ -1663,7 +1621,6 @@
     let blastSet = mapMode === "blast" ? getBlastRadius(selected, graph) : new Set();
 
     const byId = new Map(graph.nodes.map((n) => [n.id, n]));
-    const elkEdgeRoutes = currentLayout === "elk" ? layoutPositions.elk?.edgeRoutes : null;
 
     const edgesG = el("g");
     graph.edges.forEach((e) => {
@@ -1687,9 +1644,7 @@
       const bCx = b.x + bW / 2, bCy = b.y + bH / 2;
       const rawDx = bCx - aCx, rawDy = bCy - aCy;
       let x1, y1, x2, y2, d;
-      const elkRoute = elkEdgeRoutes?.get(edgeKey(e));
-      d = edgeRouteToPath(elkRoute);
-      if (!d && Math.abs(rawDx) >= Math.abs(rawDy) * 0.6) {
+      if (Math.abs(rawDx) >= Math.abs(rawDy) * 0.6) {
         // Horizontal exit/entry
         x1 = rawDx >= 0 ? a.x + aW : a.x;
         y1 = aCy;
@@ -1698,7 +1653,7 @@
         const ctrl = Math.max(50, Math.abs(x2 - x1) * 0.45 + Math.abs(y2 - y1) * 0.1);
         const sx = x2 >= x1 ? 1 : -1;
         d = `M${x1},${y1} C${x1+sx*ctrl},${y1} ${x2-sx*ctrl},${y2} ${x2},${y2}`;
-      } else if (!d) {
+      } else {
         // Vertical exit/entry — use center-X, exit bottom or top
         x1 = aCx;
         y1 = rawDy >= 0 ? a.y + aH : a.y;
